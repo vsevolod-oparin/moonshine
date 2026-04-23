@@ -156,7 +156,7 @@ Restructure encoder into three stages with different frame rates. For the **Smal
 Stage 1 (fine):    50Hz, layers 0-2,   window (16,4)  — phonetic detail
 Stage 2 (coarse):  25Hz, layers 3-6,   window (8,2)   — word-level features
 Stage 3 (fine):    50Hz, layers 7-9,   window (16,4)  — final refinement
-                                           ↑ upsampling + skip connection from Stage 1
+                                            ↑ upsampling + skip connection from Stage 1
 ```
 
 **Why**:
@@ -166,9 +166,15 @@ Stage 3 (fine):    50Hz, layers 7-9,   window (16,4)  — final refinement
 - Deeper layers at 25Hz process 2x fewer frames → less attention compute
 - Skip connection preserves fine detail lost during downsampling
 
+**Downsample** (Stage 1 → Stage 2): Causal learned convolution with stride 2 (kernel=2, stride=2, left-only padding). This is strictly causal — no future frame leakage.
+
+**Upsample** (Stage 2 → Stage 3): Nearest-neighbor repeat (each frame duplicated) followed by a learned 1x1 convolution to blend adjacent frames. Strictly causal.
+
+**Skip connection**: Element-wise addition of Stage 1 output (50Hz) to Stage 3 output (after upsampling to 50Hz). Preserves fine phonetic detail.
+
 **Compute savings**: Stage 2 operates on half the frames. ~20% fewer total FLOPs for the encoder.
 
-**Latency cost**: None additional — the stride-2 down/up sampling is causal.
+**Latency cost**: None additional — all down/up operations are causal.
 
 #### Change 3: SSC-Style Cross-Window Context
 
@@ -194,6 +200,16 @@ The added convolution is depthwise (1 filter per channel), so parameter increase
 
 **Note**: Both v2 and v2.1 Small use 10 encoder layers. The v2.1 restructuring fits within the same layer budget (3+4+3). This ensures fair comparison — improvements come from architecture, not capacity.
 
+**FLOPs comparison** (Small encoder, T=250 frames at 50Hz):
+
+| | v2 Small | v2.1 Small |
+|---|---|---|
+| Attention FLOPs | 10 layers × O(T×w) = 10 × 250×16 | 6 layers × O(250×16) + 4 layers × O(125×8) |
+| FFN FLOPs | 10 layers × O(T×d²) | 6 layers × O(250×d²) + 4 layers × O(125×d²) |
+| **Total (relative)** | **1.0x** | **~0.8x** |
+
+v2.1 processes 4 of 10 layers at half the frame rate (25Hz), reducing encoder FLOPs by ~20% despite the added conv modules. This means v2.1 should be both more accurate AND faster than v2.
+
 ### 3.4 Streaming Decoder Mechanics
 
 The encoder produces streaming outputs via sliding-window attention. The **decoder** must consume these incrementally:
@@ -203,6 +219,8 @@ The encoder produces streaming outputs via sliding-window attention. The **decod
 **Cross-attention window**: The decoder cross-attends to **all encoder frames accumulated in the current utterance segment**. For short utterances (< 3s), this is the full utterance. For long utterances, the decoder sees a growing window. The encoder's sliding-window already ensures each encoder output captures local context, so even growing cross-attention is bounded in compute per frame.
 
 **Token emission**: The decoder generates tokens autoregressively. In streaming, the decoder is invoked once per trigger event (not per frame). Tokens are emitted as a batch for that segment. Deduplication handles overlap between consecutive segments.
+
+**Segment deduplication**: Consecutive decoder invocations may produce overlapping text. On each new decoder output, compare the last 2 words of the previous segment's output with the first 2 words of the current output. Discard matching prefix words. This simple word-level overlap handling is O(N) and covers the common case of segment boundary repetition.
 
 **Decoder KV cache**: The decoder's self-attention KV cache is carried across segments within the same utterance (continuous speech). It is reset at VAD boundaries (new utterance). This preserves coherence within a single speaker turn.
 
@@ -252,6 +270,10 @@ Train custom (not reuse Whisper's multilingual tokenizer):
 - Training data comes from the same transcripts used for ASR training — no extra work
 
 Test 256, 512, and 1024 for Small production. The tradeoff is decoder speed (more tokens per word at smaller vocab) vs embedding size. GigaAM achieves SOTA Russian WER (8.4%) with 256 tokens, proving vocab size does not limit accuracy for Russian.
+
+### Subword Regularization
+
+During training, enable SentencePiece stochastic subword sampling (`nbest_size=5`, `alpha=0.1`) to sample different valid BPE segmentations per epoch. This makes the model robust to tokenization boundary ambiguity — especially valuable for Russian where word-internal morpheme boundaries are ambiguous (e.g., "переписывать" → "пере/пис/ывать" or "перепис/ывать"). At inference, use deterministic encoding (`nbest_size=1`). One-line parameter change, minor robustness gain.
 
 ---
 
@@ -312,10 +334,13 @@ Validate mixing by checking per-dataset validation WER during Phase 1. If any da
 5. **Text normalization**:
    - Lowercase
    - Normalize numbers to words using `ru_num2words` (handles Russian declension: "1 тысяча" / "2 тысячи" / "5 тысяч", gendered forms, compound numbers). Manual review of edge cases on 1000 training samples
+   - Abbreviation expansion: dictionary of ~200 common Russian abbreviations with spoken forms (США → "с ш а", МГУ → "эм гэ у", ФСБ → "эф эс бэ"). Some are spelled out, some read as words — use the most common spoken form
+   - Date and time normalization: gendered and declined forms ("1 мая" → "первого мая", "23 февраля" → "двадцать третьего февраля")
+   - Hyphenated words: keep as single tokens (standard for Russian NLP — "какой-то", "из-за", "по-русски")
    - Remove non-speech markers (laughter, cough annotations)
    - Unified punctuation handling
 6. **Deduplicate** across datasets
-7. **Split**: 95% train / 5% validation, no speaker overlap
+7. **Split**: 95% train / 5% validation, no speaker overlap with test. Within each dataset, split by speaker ID (available for Common Voice, MLS). Cross-dataset speaker overlap is accepted as minor noise — different speaker ID namespaces make deduplication impractical
 
 ### Data Augmentation
 
@@ -450,6 +475,20 @@ English Moonshine was trained on 300K hours. The audio preprocessor and encoder 
 | Pseudo-labeling | +10-30% rel. | Medium | 3 | v2 + v2.1 |
 | Schedule-Free optimizer | Simplifies tuning | Low | 1 | v2 + v2.1 |
 | Transfer learning (optional) | +10-30% rel. | Low | 1b | v2 + v2.1 |
+| Dropout + attention dropout | +1-3% rel. | Low | 1 | v2 + v2.1 |
+
+---
+
+### 6.10 Regularization
+
+English Moonshine's 300K hours provided implicit regularization. With 5.4K hours, explicit regularization is needed to prevent overfitting to training speakers and acoustic conditions.
+
+**Configuration**:
+- Attention dropout: 0.1 — prevents attention overfitting to specific positions
+- FFN dropout: 0.1 — prevents co-adaptation of features
+- Drop path / stochastic depth: 0.1 (v2.1 only, with deeper multi-scale encoder) — randomly skips encoder layers during training, regularizes deep encoders
+
+**Expected impact**: +1-3% relative WER improvement. Standard in production ASR (GigaAM, Conformer models). Tunable via Phase 1 validation WER.
 
 ---
 
@@ -531,6 +570,27 @@ Export encoder and decoder as separate ONNX graphs. Apply graph-level operator f
 | INT8 quantization | 2-3x faster CPU | 2-4x smaller | 1 | v2 + v2.1 |
 | Speculative decoding | 3-4x decoder speedup | +34M (draft model) | 3 | v2 + v2.1 |
 | ONNX operator fusion | 20-40% faster | None | 1 | v2 + v2.1 |
+| Beam search + LM fusion | None (more compute) | +LM (~50MB) | 2 | v2 + v2.1 |
+
+### 7.6 Decoding Strategy
+
+The plan already trains a KenLM on Russian Wikipedia for pseudo-label filtering (Section 6.4). This same LM is reused for shallow fusion during decoding — zero additional training cost.
+
+**Decoding modes**:
+
+| Mode | Description | When to Use |
+|------|-------------|-------------|
+| Greedy | argmax at each decoder step | Phase 1 baseline, streaming where latency is critical |
+| Beam search (width 5-8) | Explore top-K hypotheses | Non-streaming mode, accuracy-focused |
+| Beam + shallow LM fusion | Beam search with external KenLM log-prob weighted into hypothesis scoring | Production deployment, both streaming and non-streaming |
+
+**LM fusion weight**: Tune on validation set (typical range 0.1-0.3). The KenLM log-probability is interpolated with the model's token log-probability: `score = model_score + λ · lm_score`.
+
+**Expected impact**: +10-15% relative WER improvement for beam+LM over greedy. Russian benefits particularly due to rich inflection and phonetically similar case endings where LM context helps disambiguate.
+
+**Streaming latency note**: Beam search adds decoder latency (K sequential decoder steps per beam position). For streaming where decoder latency budget is tight, use greedy or beam width 3. For non-streaming, use beam width 8 + LM.
+
+**Reporting**: Always report both greedy and beam+LM WER to quantify the decoding strategy's contribution.
 
 ---
 
@@ -576,7 +636,7 @@ These validate the full toolchain.
 
 | # | Test | What It Catches | Pass Criteria |
 |---|------|----------------|---------------|
-| T12 | **Tokenizer roundtrip** | BPE encode/decode is lossy, special token handling broken | 1000 Russian sentences from Common Voice/Golos → encode → decode → exact string match. Test with: normal text, numbers, hyphenated words, quoted text, English loanwords. Include 200 number-containing sentences to validate `ru_num2words` normalization |
+| T12 | **Tokenizer roundtrip** | BPE encode/decode is lossy, special token handling broken | 1000 Russian sentences from Common Voice/Golos → encode → decode → exact string match. Test with: normal text, numbers, hyphenated words, quoted text, English loanwords, abbreviations (США, МГУ), dates ("1 мая", "23 февраля"). Include 200 number-containing sentences to validate `ru_num2words` normalization |
 | T13 | **Tokenizer morphology coverage** | BPE vocab too small → excessive fragmentation → slow decoder | Measure average tokens per word on 10K Russian sentences. Target: ≤ 3.0 tokens/word for vocab 256, ≤ 2.0 for vocab 1024. Also measure: % of words encoded as single token. Measure fragmentation of top 100 English loanwords |
 | T14 | **ONNX export smoke test** | Export graph breaks, unsupported ops, shape mismatches | PyTorch model → `torch.onnx.export` → load in ONNX Runtime → run inference. Output diff < 1e-4 vs PyTorch. Test encoder and decoder separately |
 | T15 | **ONNX streaming test** | Streaming semantics lost in export (KV cache not preserved) | Export encoder with cache inputs/outputs. Run chunk-by-chunk inference in ONNX Runtime. Compare to PyTorch streaming output. Diff < 1e-4 |
@@ -628,9 +688,15 @@ Day 6-8:  T16, T17, T18  (scale-up readiness — validates before cloud spend)
 
 **Effective batch size**: Target 128-256 via gradient accumulation. On H100 with Small batch=16 per GPU, accumulation steps = 8-16. On 3090 with Small batch=8, accumulation steps = 16-32.
 
+**Distributed training**: Phase 1-2 (Tiny/Small on 3090 or single H100): single GPU with gradient accumulation. Phase 3 Medium (245M): if single H100 OOM, wrap model with PyTorch FSDP and gradient checkpointing — no architecture changes needed.
+
+**Experiment tracking**: Use TensorBoard (built into PyTorch, zero dependencies). Log per-step: loss (AED + CTC separately), learning rate, gradient norm. Log every 2K steps: validation WER, per-dataset WER. Each training run records: config YAML, git commit hash, random seed.
+
+**Reproducibility**: Pin all dependencies (PyTorch, CUDA, Python versions) in a Dockerfile for cloud GPU runs. Each training run gets a unique ID + config file. Released weights include a model card with training details.
+
 ### Phase 0: Setup (3-5 days, local 3090, $0)
 
-- Clone Moonshine repo, set up environment
+- Clone Moonshine repo, set up environment (Dockerfile with pinned dependencies)
 - Train Russian SentencePiece BPE tokenizer (256 tokens)
 - Build data pipeline: download, preprocess, create manifests
 - Run PoC tests T1-T18 (see Section 8)
@@ -649,6 +715,7 @@ Day 6-8:  T16, T17, T18  (scale-up readiness — validates before cloud spend)
 | Precision | FP16 (mixed) |
 | Loss | L_AED + 0.3 · L_CTC |
 | Label smoothing | ε=0.1 on decoder loss |
+| Dropout | Attention 0.1, FFN 0.1 |
 | Optimizer | Schedule-Free, LR 2e-3 |
 | Augmentation | SpecAugment + speed perturbation + MUSAN noise |
 | Hardware | RTX 3090 (24GB) |
@@ -712,11 +779,14 @@ Train BOTH v2 and v2.1 Small with best HP:
 | Precision | BF16 (mixed) |
 | Loss | L_AED + α_best · L_CTC |
 | Label smoothing | ε=0.1 on decoder loss |
+| Dropout | Attention 0.1, FFN 0.1, drop path 0.1 (v2.1 only) |
 | Optimizer | Schedule-Free, LR from HP search |
 | Augmentation | SpecAugment + speed perturbation + MUSAN noise + RIR |
 | Dynamic chunks | w_left ∈ [8,16], w_right ∈ [0,4] |
 | Hardware | 1× H100 |
 | Time | ~2-3 days per model |
+
+**Optional curriculum**: If validation WER plateaus early in training, try ordering data: epochs 1-2 on cleaner subsets (Common Voice validated + MLS), epochs 3+ with full mix including noisier data (Golos far-field, SOVA). Evaluate empirically — if no difference vs. random shuffling, drop it.
 
 **WER targets** (tiered expectations):
 
@@ -748,8 +818,12 @@ If Small doesn't meet targets:
 Distill Small → Tiny using:
 - Teacher: trained Small model (v2 or v2.1, whichever is better)
 - Student: Tiny architecture (same track as teacher)
-- Method: KL divergence on logits + CTC loss + hidden-state matching
-- Benefit: Tiny model approaching Small-level accuracy for phone-class devices
+- Method:
+  1. KL divergence on logits (soft targets from teacher with temperature 2.0)
+  2. CTC auxiliary loss on student encoder output
+  3. Hidden-state matching: L2 loss between student and teacher encoder outputs (with learned projection to match dimensions)
+- Training: Train student for 50K steps on same data, with loss = α·L_KL + β·L_CTC + γ·L_hidden where α=0.7, β=0.2, γ=0.1
+- Benefit: Tiny model approaching Small-level accuracy for phone-class devices. Expected: Tiny distilled WER within 1-2% of Small (vs 3-5% gap from training Tiny directly)
 
 ---
 
@@ -771,7 +845,8 @@ Report test WER **once** per finalized model. Do not iterate on test.
 
 | Metric | Description | Target (Small) |
 |--------|-------------|----------------|
-| WER (Word Error Rate) | Primary accuracy | See tiered targets (Section 9) |
+| WER (Word Error Rate) | Primary accuracy, greedy decoding | See tiered targets (Section 9) |
+| WER (beam + LM) | Beam search (width 8) + shallow LM fusion | 10-15% relative improvement over greedy |
 | CER (Character Error Rate) | Character-level accuracy | < 3% |
 | G2P-normalized WER | Convert reference+hypothesis to phonemes before WER | Secondary metric |
 | TTFT (Time-to-First-Token) | Streaming latency | < 100ms on MacBook CPU |
@@ -780,6 +855,47 @@ Report test WER **once** per finalized model. Do not iterate on test.
 | Non-streaming WER | Full-context encoder + decoder | Quantifies streaming cost |
 
 **G2P-normalized WER**: Convert both reference and hypothesis to phonemes using a rule-based Russian G2P before computing WER. Russian is nearly phonetic, so G2P is straightforward. This metric ignores orthographic case-ending variation (e.g., "большой дом" vs "большого дома" — acceptable errors) while catching phonetic errors (real errors). Useful for Russian where case endings are phonetically reduced in connected speech.
+
+### Error Analysis
+
+After each training phase, run error categorization on 500+ validation samples. Classify each word error into:
+
+| Error Type | Example | Diagnostic Value |
+|-----------|---------|------------------|
+| Consonant cluster | "вств" → "ст" | Causal conv effectiveness (v2.1) |
+| Vowel reduction | unstressed "о" → "а" predicted as "о" | Natural speech data sufficiency |
+| Proper noun | Names, places, brands | Training text diversity |
+| Code-switching | "email" garbled | English loanword tokenizer coverage |
+| Morphological | Wrong case ending | LM rescoring impact |
+| Boundary | Missing/extra words at chunk edges | Streaming chunking quality |
+| Homophone | "код" vs "кот" | Context modeling quality |
+
+Identify top-3 error categories by frequency after each phase. Target next phase improvements toward those categories. One-time script: word-level alignment + rule-based categorization for Russian.
+
+### Benchmarking Protocol
+
+Latency claims are reproducible only with a defined methodology:
+
+```
+Hardware: MacBook Pro M2 (specific model year), 16GB RAM
+Runtime: ONNX Runtime 1.x, CPU execution provider
+Model: Small, INT8 dynamic quantization
+Audio: 100 utterances from Common Voice test split, 5-15s each
+Measurement: Average TTFT over 100 utterances
+Precondition: 10 warmup runs, then measure
+Environment: No other CPU-intensive processes
+Decoding: Greedy (for latency), Beam+LM (for accuracy)
+```
+
+Apply equivalent methodology per target platform (iPhone, Android, Pi). Report hardware model, runtime version, and decoding mode alongside every latency number.
+
+### Attention Monitoring
+
+During Phase 1 evaluation, visualize encoder attention patterns on 10 validation utterances. Check for attention sink behavior (disproportionate attention to initial frames, as reported by XLSR-Transducer). Moonshine's ergodic encoder (no positional embeddings) may be less susceptible. If sinks appear, add a learnable sink token to encoder input in Phase 2.
+
+### Known Coverage Gaps
+
+**Accented and dialectal speech**: Training data is predominantly metropolitan Russian. Dialectal variation (Southern Russian, Ukrainian-accented, Central Asian Russian) is not covered. Phase 4 stretch goal: collect 50-100 diverse-accent samples for coverage testing.
 
 ### Benchmarks
 
@@ -847,8 +963,21 @@ Note: This is inference latency only. Audio capture pipeline (AVAudioEngine/Audi
    b. Cross-attends to accumulated encoder outputs in current segment
    c. Decoder KV cache carried within utterance, reset at VAD boundary
    d. Optional: speculative decoding with Tiny draft
-6. Text output (post-process)
+6. LM rescoring (optional): apply KenLM shallow fusion during beam search
+7. Segment deduplication: word-level overlap check between consecutive segments
+8. Text output (post-process)
 ```
+
+### Streaming Failure Modes
+
+| Failure | Cause | Mitigation |
+|---------|-------|------------|
+| Truncated first word | VAD misses speech onset (< 200ms) | Minimum speech duration filter: reject VAD segments < 200ms. Buffer last 200ms of "silence" before speech onset |
+| Spurious decoder output | VAD false positive (background noise triggers speech detection) | Minimum decoder confidence threshold: discard decoder output if average log-prob < threshold |
+| Missing words at boundaries | Segment split mid-word | Decoder trigger at 64 frames (1.28s) is conservative enough to avoid mid-word splits in most cases. Deduplication handles residual overlap |
+| Decoder latency spike | Fast speaker produces many tokens per segment | Increase trigger frame count (64 → 96) for fast speech. Measure decoder latency per segment in production |
+| Background speech | Other speakers trigger VAD | Silero VAD is single-speaker. Multi-speaker separation is out of scope — document as known limitation |
+| Audio buffer overflow | Very long utterance (> 30s continuous speech) | Force decoder trigger at max segment length (30s / 1500 encoder frames) regardless of VAD |
 
 ### Output Post-Processing
 
@@ -952,6 +1081,7 @@ Training tricks (shared):                 Training tricks (shared):
 ✓ Dynamic chunk training                  ✓ Dynamic chunk training
 ✓ Schedule-Free optimizer                 ✓ Schedule-Free optimizer
 ✓ Label smoothing (ε=0.1)                ✓ Label smoothing (ε=0.1)
+✓ Dropout (attention 0.1, FFN 0.1)       ✓ Dropout (attention 0.1, FFN 0.1, drop path 0.1)
 ✓ Pseudo-labeling pipeline                ✓ Pseudo-labeling pipeline
 ○ Transfer learning (optional)            ○ Transfer learning (optional)
 
@@ -961,6 +1091,7 @@ Inference (shared):                       Inference (shared):
 ✓ Speculative decoding (Tiny→Small)       ✓ Speculative decoding (Tiny→Small)
 ✓ ONNX export + operator fusion           ✓ ONNX export + operator fusion
 ✓ Punctuation token output                ✓ Punctuation token output
+✓ Beam search + shallow LM fusion         ✓ Beam search + shallow LM fusion
 
 Tooling:                                  Tooling:
 Existing moonshine repo                   Custom fork
@@ -999,3 +1130,5 @@ Existing moonshine repo                   Custom fork
 - See MOONSHINE_DS_CRITIC_RESPONSE.md for response to that review
 - See MOONSHINE_CRITIC_V2.md for second-pass critical review
 - See MOONSHINE_GLM_COMMENTS.md for tokenizer analysis
+- See MOONSHINE_CRITIC_V3.md for third-pass critical review
+- See MOONSHINE_CRITIC_V3_RESPONSE.md for response to V3 review
