@@ -690,7 +690,96 @@ Day 6-8:  T16, T17, T18  (scale-up readiness — validates before cloud spend)
 
 **Distributed training**: Phase 1-2 (Tiny/Small on 3090 or single H100): single GPU with gradient accumulation. Phase 3 Medium (245M): if single H100 OOM, wrap model with PyTorch FSDP and gradient checkpointing — no architecture changes needed.
 
-**Experiment tracking**: Use TensorBoard (built into PyTorch, zero dependencies). Log per-step: loss (AED + CTC separately), learning rate, gradient norm. Log every 2K steps: validation WER, per-dataset WER. Each training run records: config YAML, git commit hash, random seed.
+**Experiment tracking**: Support both Weights & Biases (wandb) and TensorBoard, selectable via config. Default: W&B.
+
+```yaml
+# In training config YAML:
+logging:
+  backend: wandb    # "wandb" or "tensorboard"
+  project: ru-moonshine
+  name: v2-tiny-phase1
+  log_every: 100         # per-step metrics
+  eval_every: 2000       # validation WER
+```
+
+Implementation: thin wrapper that calls wandb or TensorBoard behind the same interface:
+
+```python
+class Logger:
+    def __init__(self, backend, project, name, config):
+        if backend == "wandb":
+            import wandb
+            wandb.init(project=project, name=name, config=config)
+        elif backend == "tensorboard":
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir=f"runs/{name}")
+
+    def log(self, metrics: dict, step: int):
+        if self.backend == "wandb":
+            wandb.log(metrics, step=step)
+        else:
+            for k, v in metrics.items():
+                self.writer.add_scalar(k, v, step)
+```
+
+Set `logging.backend: tensorboard` if W&B is unavailable (firewall, cloud restrictions, offline training). TensorBoard logs to local `runs/` directory — view with `tensorboard --logdir runs/`. For cloud H100, SSH tunnel: `ssh -L 6006:localhost:6006 user@cloud-host`.
+
+W&B advantages (when available): cloud-hosted (no SSH needed), auto-captured system metrics, cross-run comparison UI. TensorBoard advantages: always works, zero dependencies beyond PyTorch, no account needed.
+
+All runs record: full config YAML, git commit hash, random seed — regardless of backend.
+
+**Training Charts** — same metrics regardless of backend:
+
+Logged every training step:
+
+| Chart | Y-axis | What to look for |
+|-------|--------|------------------|
+| `loss/total` | Total loss (AED + α·CTC) | Should decrease monotonically. Plateau = convergence. Spike = instability |
+| `loss/aed` | Decoder cross-entropy | Decreases slower than CTC. Plateau at ~1-3 is normal |
+| `loss/ctc` | CTC loss | Should decrease fast early (encoder learns alignments quickly) |
+| `train/grad_norm` | Gradient L2 norm | Should stay < 100. Spikes > 1000 = learning rate too high or data issue |
+| `train/lr` | Learning rate | Schedule-Free auto-adapts. Should show decay pattern |
+
+Logged every 2K steps:
+
+| Chart | Y-axis | What to look for |
+|-------|--------|------------------|
+| `val/wer` | Validation WER (greedy) | **Primary metric.** Should decrease. Plateau for 3 evals = early stop |
+| `val/wer_cv` | WER on Common Voice subset | Track per-dataset to catch domain imbalance |
+| `val/wer_golos` | WER on Golos subset | Far-field WER. If >> val/wer, need more far-field data/augmentation |
+| `val/cer` | Character error rate | Should track WER. Divergence = morphological issues |
+
+Auto-captured system metrics (W&B only — TensorBoard requires manual logging):
+
+| Chart | What it shows |
+|-------|---------------|
+| GPU utilization | Should be > 85% during training. < 70% = data loading bottleneck |
+| GPU memory (VRAM) | Should be stable. Growing = memory leak |
+| GPU temperature | Should stabilize at 70-85°C on 3090. > 90°C = thermal throttle |
+| GPU power draw | 3090: ~250-350W sustained. Lower = underutilized |
+
+**Run organization**:
+
+```
+Project: ru-moonshine
+├── Group: phase1-tiny
+│   ├── Run: v2-tiny-700h
+│   └── Run: v21-tiny-700h
+├── Group: ablation
+│   ├── Run: abl-B-conv-only
+│   ├── Run: abl-C-multiscale-only
+│   ├── Run: abl-D-conv-multiscale
+│   └── Run: abl-E-full-v21
+├── Group: phase2-small
+│   ├── Run: v2-small-5k4h
+│   └── Run: v21-small-5k4h
+└── Group: hp-search
+    ├── Run: hp-lr1e4-ctc03
+    ├── Run: hp-lr3e4-ctc03
+    └── Run: hp-lr3e4-ctc05
+```
+
+W&B: cross-run comparison and overlay built-in. TensorBoard: use `--logdir_spec` to compare runs.
 
 **Reproducibility**: Pin all dependencies (PyTorch, CUDA, Python versions) in a Dockerfile for cloud GPU runs. Each training run gets a unique ID + config file. Released weights include a model card with training details.
 

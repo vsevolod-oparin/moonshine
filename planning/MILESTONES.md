@@ -55,15 +55,16 @@ M1 ──→ M2 ──→ M3 ──→ M4 ──→ M5 ──→ M6 ──→ M7
 3. Create `Dockerfile` with pinned versions:
    - Python 3.11
    - PyTorch 2.x + CUDA 12.x
-   - `sentencepiece`, `schedulefree`, `onnxruntime`, `torchaudio`
-   - `ru_num2words` for text normalization
+   - `sentencepiece`, `schedulefree`, `onnxruntime`, `torchaudio`, `wandb`
 4. Create `requirements.txt` with exact versions
-5. Verify: `docker build -t ru-moonshine . && docker run --gpus all ru-moonshine python -c "import torch; print(torch.cuda.is_available())"`
+5. `wandb login` — authenticate Weights & Biases (free individual account). If W&B is unavailable, TensorBoard works as fallback (no setup needed)
+6. Verify: `docker build -t ru-moonshine . && docker run --gpus all ru-moonshine python -c "import torch; print(torch.cuda.is_available())"`
 6. Copy Moonshine model definitions from HuggingFace `transformers.models.moonshine` into `models/` as starting point
 7. Init git repo, commit baseline
 
 ### Self-Check
 
+- [ ] `wandb login` succeeds (skip if using TensorBoard only)
 - [ ] Docker container builds and sees GPU
 - [ ] `import torch; import sentencepiece; import schedulefree` all succeed inside container
 - [ ] Moonshine model code is in `models/` and imports without error
@@ -75,8 +76,10 @@ Docker builds. GPU detected. All imports work.
 
 ### Deliverables
 
-- `Dockerfile`, `requirements.txt`
+- `Dockerfile`, `requirements.txt` (with `wandb`)
 - Project structure with Moonshine model code copied
+- W&B project created at `wandb.ai/<your-workspace>/ru-moonshine` (if using W&B)
+- Fallback: TensorBoard works with `tensorboard --logdir runs/`
 - Initial git commit
 
 ---
@@ -288,7 +291,26 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 3. Implement validation loop:
    - Every 2K steps: CTC greedy decoding on validation set → WER
    - Log: AED loss, CTC loss, total loss, WER, learning rate, gradient norm
-   - TensorBoard logging
+   - Dual-backend logging: W&B (default) or TensorBoard, selected via `logging.backend` in config YAML
+   - Thin `Logger` wrapper: same `log(metrics, step)` interface, calls wandb or SummaryWriter underneath
+4. Implement logger (`training/logger.py`):
+   ```python
+   class Logger:
+       def __init__(self, backend, project, name, config):
+           if backend == "wandb":
+               import wandb
+               wandb.init(project=project, name=name, config=config)
+           elif backend == "tensorboard":
+               from torch.utils.tensorboard import SummaryWriter
+               self.writer = SummaryWriter(log_dir=f"runs/{name}")
+
+       def log(self, metrics: dict, step: int):
+           if self.backend == "wandb":
+               wandb.log(metrics, step=step)
+           else:
+               for k, v in metrics.items():
+                   self.writer.add_scalar(k, v, step)
+   ```
 4. Implement checkpointing:
    - Save every 5K steps: model, optimizer, scheduler, step count, best WER
    - Retain top-3 by val WER + latest
@@ -313,7 +335,8 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 ### Self-Check
 
 - [ ] Training loop runs for 100 steps on random data without error
-- [ ] TensorBoard shows loss curves
+- [ ] Logger shows metrics (W&B dashboard at wandb.ai, or `tensorboard --logdir runs/`)
+- [ ] Switching `logging.backend: tensorboard` works without code changes
 - [ ] Checkpoint saves and loads correctly
 - [ ] Gradient accumulation produces correct effective batch size
 - [ ] T7: CTC loss finite, positive, decreasing
@@ -328,6 +351,7 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 - `training/train.py` — full training loop
 - `training/validate.py` — WER evaluation
 - `training/checkpoint.py` — save/load/resume
+- `training/logger.py` — dual-backend logger (wandb / tensorboard, config-selected)
 - `configs/train_v2_tiny.yaml` — example training config
 
 ---
@@ -447,6 +471,7 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
    regularization: {attention_dropout: 0.1, ffn_dropout: 0.1}
    checkpointing: {save_every: 2000, keep_top: 3, eval_every: 2000}
    optimizer: {name: schedulefree, lr: 2e-3}
+   logging: {backend: wandb, project: ru-moonshine, name: v2-tiny-phase1, log_every: 100, eval_every: 2000}
    ```
 3. Run **T16: 100-hour convergence test**:
    - Train 1 epoch on 100h subset of CV19 Russian
@@ -484,10 +509,11 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 ### Actions
 
 1. Start training: `python training/train.py --config configs/phase1_v2_tiny.yaml`
-2. Monitor via TensorBoard:
-   - AED loss, CTC loss, total loss (should all decrease)
-   - Validation WER every 2K steps (should decrease, target: converge < 25%)
-   - Gradient norm (should stay < 100, no spikes)
+2. Monitor via W&B dashboard (wandb.ai/your-workspace/ru-moonshine) or TensorBoard (`tensorboard --logdir runs/`):
+   - **Loss curves**: AED loss, CTC loss, total loss (should all decrease)
+   - **Validation WER**: every 2K steps (should decrease, target: converge < 25%)
+   - **System metrics** (W&B only): GPU utilization, VRAM usage, GPU temperature, power draw
+   - **Gradient norm**: should stay < 100, no spikes
 3. Wait for convergence (3 epochs or early stop)
 4. Select best checkpoint by validation WER
 5. Evaluate best checkpoint:
@@ -532,7 +558,7 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 ### Actions
 
 1. Start training: `python training/train.py --config configs/phase1_v21_tiny.yaml`
-2. Same monitoring as M9
+2. Same monitoring as M9 (W&B or TensorBoard — compare runs side-by-side)
 3. Select best checkpoint by validation WER
 4. Same evaluation as M9
 5. Compare v2 vs v2.1:
@@ -623,6 +649,8 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 1. Set up cloud environment:
    - Launch H100 instance with Docker image from M1
+   - `wandb login` on cloud instance (if using W&B — same account, all runs in one dashboard)
+   - If W&B unavailable on cloud: set `logging.backend: tensorboard` in config, use `ssh -L 6006:localhost:6006` to view
    - Upload code, tokenizer, data manifests (not raw audio — download on cloud)
    - Download raw audio on cloud instance (faster than uploading)
    - Verify data pipeline works on cloud
@@ -635,6 +663,7 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
    ```
    Each run: ~4-8 hours on H100 with 1K hours
 4. Evaluate each run: validation WER, loss curves, convergence speed
+   - W&B: overlay HP runs in dashboard. TensorBoard: `tensorboard --logdir_spec hp1:runs/hp1,hp2:runs/hp2`
 5. Select best HP config
 
 ### Self-Check
@@ -675,6 +704,9 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
    augmentation: {spec_augment: true, speed_perturbation: true, musan_noise: true, rir: true}
    ```
 3. Monitor closely for first 2K steps (loss should decrease, no NaN, no explosion)
+   - W&B: watch from laptop, no SSH needed. TensorBoard: `ssh -L 6006:localhost:6006`
+   - Check: GPU utilization > 90% (if not, data loading is bottleneck)
+   - Check: VRAM usage stable (if growing, memory leak)
 4. Let run to completion (3-5 epochs)
 5. Select best checkpoint by validation WER
 6. Full evaluation:
