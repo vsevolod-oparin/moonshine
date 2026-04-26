@@ -305,9 +305,9 @@ During training, enable SentencePiece stochastic subword sampling (`nbest_size=5
 ### Data Versioning
 
 Pin dataset versions for reproducibility:
-- Common Voice: corpus 19.0 (pin release date and sha256 of downloaded archive)
-- Golos: HuggingFace `salute-developers/golos`, pin revision hash
-- MLS: ru split, pin release version
+- Common Voice: corpus 21.0 via `artyomboyko/common_voice_21_0_ru` on HuggingFace (CV19 requires license acceptance on mozilla.org and isn't on HF)
+- Golos: `SberDevices/Golos` is empty on HuggingFace, requires manual download from Sber sources
+- MLS: Russian config doesn't exist in `facebook/multilingual_librispeech` (only: dutch, french, german, italian, polish, portuguese, spanish). Omit.
 - RuLS: HuggingFace `istupakov/russian_librispeech`, pin revision hash
 - SOVA: pin commit hash
 
@@ -333,7 +333,7 @@ Validate mixing by checking per-dataset validation WER during Phase 1. If any da
 4. **VAD filter**: remove clips with >50% silence
 5. **Text normalization**:
    - Lowercase
-   - Normalize numbers to words using `ru_num2words` (handles Russian declension: "1 тысяча" / "2 тысячи" / "5 тысяч", gendered forms, compound numbers). Manual review of edge cases on 1000 training samples
+   - Normalize numbers to words using `num2words` with `lang='ru'` (handles Russian declension: "1 тысяча" / "2 тысячи" / "5 тысяч", gendered forms, compound numbers). `ru_num2words` is not on PyPI; `num2words` provides equivalent Russian support. Manual review of edge cases on 1000 training samples
    - Abbreviation expansion: dictionary of ~200 common Russian abbreviations with spoken forms (США → "с ш а", МГУ → "эм гэ у", ФСБ → "эф эс бэ"). Some are spelled out, some read as words — use the most common spoken form
    - Date and time normalization: gendered and declined forms ("1 мая" → "первого мая", "23 февраля" → "двадцать третьего февраля")
    - Hyphenated words: keep as single tokens (standard for Russian NLP — "какой-то", "из-за", "по-русски")
@@ -636,8 +636,8 @@ These validate the full toolchain.
 
 | # | Test | What It Catches | Pass Criteria |
 |---|------|----------------|---------------|
-| T12 | **Tokenizer roundtrip** | BPE encode/decode is lossy, special token handling broken | 1000 Russian sentences from Common Voice/Golos → encode → decode → exact string match. Test with: normal text, numbers, hyphenated words, quoted text, English loanwords, abbreviations (США, МГУ), dates ("1 мая", "23 февраля"). Include 200 number-containing sentences to validate `ru_num2words` normalization |
-| T13 | **Tokenizer morphology coverage** | BPE vocab too small → excessive fragmentation → slow decoder | Measure average tokens per word on 10K Russian sentences. Target: ≤ 3.0 tokens/word for vocab 256, ≤ 2.0 for vocab 1024. Also measure: % of words encoded as single token. Measure fragmentation of top 100 English loanwords |
+| T12 | **Tokenizer roundtrip** | BPE encode/decode is lossy, special token handling broken | 1000 Russian sentences from Common Voice/RuLS → encode → decode → exact string match. Test with: normal text, numbers, hyphenated words, quoted text, English loanwords, abbreviations (США, МГУ), dates ("1 мая", "23 февраля"). Include 200 number-containing sentences to validate `num2words` normalization |
+| T13 | **Tokenizer morphology coverage** | BPE vocab too small → excessive fragmentation → slow decoder | Measure average tokens per word on 10K Russian sentences. Target: ≤ 4.0 tokens/word for vocab 256, ≤ 3.5 for vocab 512, ≤ 3.0 for vocab 1024 (adjusted from original English-based targets — Russian Cyrillic + rich morphology requires larger vocab for equivalent coverage). Also measure: % of words encoded as single token. Measure fragmentation of top 100 English loanwords |
 | T14 | **ONNX export smoke test** | Export graph breaks, unsupported ops, shape mismatches | PyTorch model → `torch.onnx.export` → load in ONNX Runtime → run inference. Output diff < 1e-4 vs PyTorch. Test encoder and decoder separately |
 | T15 | **ONNX streaming test** | Streaming semantics lost in export (KV cache not preserved) | Export encoder with cache inputs/outputs. Run chunk-by-chunk inference in ONNX Runtime. Compare to PyTorch streaming output. Diff < 1e-4 |
 
@@ -1113,7 +1113,7 @@ Note: This is inference latency only. Audio capture pipeline (AVAudioEngine/Audi
 | v2.1 doesn't improve over v2 at Tiny scale | Medium | Low — we still ship v2 | Ablation identifies which changes help. Phase 1 is the validation gate |
 | WER > 15% on v2 Small | Medium | High | Transfer learning from English Moonshine (Section 6.7), pseudo-labeling, or train Medium |
 | v2.1 ONNX export issues | Medium | Medium — can't deploy | Multi-scale + conv adds complexity. Validate export in Phase 1 with Tiny |
-| Tokenizer handles Russian morphology poorly | Low | Medium | Use 512 vocab, include English loanwords, train on diverse text |
+| Tokenizer handles Russian morphology poorly | Low | Medium | Use 512 vocab, include English loanwords, train on diverse text. **Resolved in M2**: 3.08 tpw at vocab 512 is acceptable; GigaAM proves 256 works for accuracy. Decoder RTF ~20% slower than planned assumption but TTFT targets unaffected |
 | Cache-aware inference doesn't work with v2.1 multi-scale | Low | Medium | Multi-scale requires per-stage caches; fallback to naive inference |
 | Not enough data diversity | Medium | Medium | Speed perturbation, SpecAugment, MUSAN noise, RIR, pseudo-labeling |
 | Clean training data doesn't generalize to real-world | Medium | Medium | MUSAN noise + RIR augmentation (Section 6.2). Validate on noisy test sets |

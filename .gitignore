@@ -6,17 +6,7 @@ dist/
 build/
 .eggs/
 
-data/processed/*
-!data/processed/.gitkeep
-data/manifests/*.jsonl
-!data/manifests/.gitkeep
-data/augmentation/*
-!data/augmentation/.gitkeep
-data/tokenizer_corpus.txt
-data/tokenizer_*.model
-data/tokenizer_*.vocab
-data/abbreviations.json
-data/versions.json
+data/
 
 *.pt
 *.ckpt
