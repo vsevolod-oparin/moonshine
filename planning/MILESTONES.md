@@ -203,8 +203,12 @@ Corpus: 103K unique sentences (CV21 ru: 122K, RuLS: 57K, deduplicated).
 6. Create manifests (JSON lines): `data/manifests/train.jsonl`, `val.jsonl`, `test.jsonl`
    - Each line: `{"audio_path": "...", "text": "...", "duration": 5.2, "dataset": "cv21", "speaker_id": "..."}`
 7. Download MUSAN corpus (noise + music + babble) and generate synthetic RIRs using Kaldi's RIR generator. Save to `data/augmentation/`
-8. Build PyTorch `Dataset` class that reads manifests, loads audio on-the-fly, applies augmentation (SpecAugment, speed perturbation, MUSAN noise, RIR — configurable via YAML)
-9. Verify data loader: iterate 100 batches, check shapes, no crashes, no NaN
+ 8. Build PyTorch `Dataset` class that reads manifests, loads audio on-the-fly, applies augmentation (SpecAugment, speed perturbation, MUSAN noise, RIR — configurable via YAML)
+    - **Vectorized SpecAugment**: generate all masks in parallel on GPU via batched random tensors, not per-sample Python loops. 10-50x faster. Source: NeMo
+    - **Adaptive time masking**: `time_width` as float (e.g., 0.05 = 5% of seq length) instead of fixed frame count. Scales masks to utterance length. Source: NeMo, ESPnet
+    - **Augmentation warmup**: skip all augmentation for first N optimizer steps (configurable, default 5000). Only apply when `global_step >= warmup_steps`. Critical for small data regime. Source: SpeechBrain
+    - **Balanced augmentation**: when running multiple augmentations in parallel, fix total batch size so augmented data doesn't overwhelm original (`parallel_augment_fixed_bs`). Source: SpeechBrain
+ 9. Verify data loader: iterate 100 batches, check shapes, no crashes, no NaN
 
 ### Self-Check
 
@@ -238,21 +242,36 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 ### Actions
 
-1. Implement v2 architecture (Tiny variant first, then parameterize for Small/Medium):
-   - `models/preprocessor.py` — copy from Moonshine, adapt for standalone use
-   - `models/encoder.py` — sliding-window Transformer encoder with configurable window sizes
-   - `models/decoder.py` — causal Transformer decoder with RoPE, cross-attention, SwiGLU
-   - `models/adapter.py` — positional embedding + linear projection
-   - `models/model.py` — full model: preprocessor → encoder → adapter → decoder + CTC head
-   - Configurable via YAML: `d_model`, `num_layers`, `num_heads`, `ffn_dim`, `vocab_size`, `window_size`
-2. Implement v2.1 encoder additions in `models/encoder_v21.py`:
-   - CausalDepthwiseConv module (kernel=7, causal padding)
-   - Multi-scale U-Net: causal stride-2 downsample (learned conv, kernel=2, stride=2, left-only padding), nearest-neighbor upsample + 1x1 conv
-   - Skip connections between stages
-   - SSC-style cross-window attention mask generation
-3. Implement streaming encoder inference in `inference/streaming_encoder.py`:
-   - Circular KV-cache buffer per layer (or per-stage for v2.1)
-   - Incremental forward: new query × cached KV
+ 1. Implement v2 architecture (Tiny variant first, then parameterize for Small/Medium):
+    - `models/preprocessor.py` — copy from Moonshine, adapt for standalone use. **Forced FP32 for STFT/mel** (wrap in `torch.amp.autocast(enabled=False)` to prevent NaN under AMP). Source: NeMo, SpeechBrain
+    - `models/encoder.py` — sliding-window Transformer encoder with configurable window sizes
+    - `models/decoder.py` — causal Transformer decoder with RoPE, cross-attention, SwiGLU
+    - `models/adapter.py` — positional embedding + linear projection
+    - `models/model.py` — full model: preprocessor → encoder → adapter → decoder + CTC head
+    - Configurable via YAML: `d_model`, `num_layers`, `num_heads`, `ffn_dim`, `vocab_size`, `window_size`
+    - **Forward contract** (from ESPnet pattern): `forward()` returns `(loss, stats_dict, batch_weight)`. Training loop logs everything from `stats` generically — no model-specific logging code needed
+    - **Attention**: use `torch.nn.functional.scaled_dot_product_attention` (PyTorch 2.0+). Auto-selects Flash/memory-efficient kernel. Manual fallback for debugging. Source: ESPnet, NeMo
+    - **Subsampling mask propagation**: preprocessor's conv2d subsampling must adjust the attention mask (`mask[:, :, :-2:2]` for stride-2 conv with kernel 3). Missing this is a common bug. Source: ESPnet
+    - **Minimum audio length check**: reject or pad audio shorter than subsampling requires (e.g., 7 frames for 4x subsampling). Source: ESPnet `TooShortUttError`
+    - **Weight initialization** (from ESPnet pattern): xavier_uniform for dim>1 params, zero for biases, `reset_parameters()` for LayerNorm/Embedding, small init for output projection
+    - **QK normalization** (optional): LayerNorm on Q/K before attention scores. Configurable via `qk_norm: true`. Source: ESPnet
+ 2. Implement v2.1 encoder additions in `models/encoder_v21.py`:
+    - CausalDepthwiseConv module (kernel=7, causal padding)
+    - Multi-scale U-Net: causal stride-2 downsample (learned conv, kernel=2, stride=2, left-only padding), nearest-neighbor upsample + 1x1 conv
+    - Skip connections between stages
+    - SSC-style cross-window attention mask generation
+ 3. Implement stochastic depth (layer drop) in encoder forward:
+    - Per-layer drop probability that linearly increases from 0 to `max_drop_rate` (default 0.1)
+    - During training: randomly skip layers with probability `p`, scale surviving layers by `1/(1-p)`
+    - During inference: use all layers (standard)
+    - Source: ESPnet (conformer_encoder.py), NeMo (conformer_encoder.py:511-513)
+ 4. Implement streaming encoder inference in `inference/streaming_encoder.py`:
+    - Circular KV-cache buffer per layer (or per-stage for v2.1)
+    - Incremental forward: new query × cached KV
+    - **StreamPositionalEncoding**: use `start_idx` offset for correct absolute positions in each chunk (not from 0). Source: ESPnet
+    - **Repetition detection**: suppress if last N emitted tokens are identical (N=4). Source: ESPnet
+    - **Hold-N mechanism**: hold back N tokens between chunks for revision with more context. Source: ESPnet
+    - **Hallucination detection**: 3 pattern detectors (4+ identical, alternating pair, repeating triple). Source: NeMo
 4. Run **T1: Forward pass smoke test**:
    - Random audio (16kHz, 5s) → full model → logits
    - Check: no crash, no NaN, logits shape = `(seq_len, vocab_size)` (256 for Tiny, 512 for Small)
@@ -298,64 +317,88 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 ### Actions
 
 1. Implement `training/train.py`:
-   - Main training loop with gradient accumulation
-   - Joint loss: `L = L_AED + α * L_CTC` (α configurable, default 0.3)
-   - Label smoothing ε=0.1 on decoder loss
-   - Dropout: attention 0.1, FFN 0.1, drop path 0.1 (v2.1 only)
-   - Gradient clipping (norm 5.0)
-2. Integrate Schedule-Free optimizer: `pip install schedulefree`, `AdamWScheduleFree` as drop-in for AdamW
-   - Call `optimizer.train()` / `optimizer.eval()` alongside model
-3. Implement validation loop:
-   - Every 2K steps: CTC greedy decoding on validation set → WER
-   - Log: AED loss, CTC loss, total loss, WER, learning rate, gradient norm
-   - Dual-backend logging: W&B (default) or TensorBoard, selected via `logging.backend` in config YAML
-   - Thin `Logger` wrapper: same `log(metrics, step)` interface, calls wandb or SummaryWriter underneath
-4. Implement logger (`training/logger.py`):
-   ```python
-   class Logger:
-       def __init__(self, backend, project, name, config):
-           if backend == "wandb":
-               import wandb
-               wandb.init(project=project, name=name, config=config)
-           elif backend == "tensorboard":
-               from torch.utils.tensorboard import SummaryWriter
-               self.writer = SummaryWriter(log_dir=f"runs/{name}")
+    - Main training loop with gradient accumulation (divide loss by `accum_steps` before backward)
+    - Joint loss: `L = L_AED + α * L_CTC` (α configurable, default 0.3)
+    - Label smoothing ε=0.1 on decoder loss
+    - Dropout: attention 0.1, FFN 0.1, drop path 0.1 (v2.1 only)
+    - Gradient clipping (norm 5.0)
+    - **Non-finite gradient handling**: after `loss.backward()`, check `grad_norm`. If inf/nan: zero gradients, skip optimizer step, log warning. Abort after 5 consecutive bad steps (patience counter). Source: all three major ASR frameworks (ESPnet, NeMo, SpeechBrain)
+    - **`optimizer.zero_grad(set_to_none=True)`**: releases gradient memory instead of zeroing. Saves ~20% peak gradient buffer memory. Source: SpeechBrain
+ 2. Implement optimizer + scheduler:
+    - Primary: Schedule-Free (`AdamWScheduleFree`, `optimizer.train()`/`optimizer.eval()` alongside model)
+    - Fallback: AdamW with warmup + cosine decay (configurable via `optimizer.name`). Warmup for N steps, cosine decay to 10% of peak. Source: standard in ESPnet, NeMo, SpeechBrain
+  3. Implement validation loop:
+     - Every 2K steps: CTC greedy decoding on validation set → WER
+     - WER aggregation: numerator/denominator pattern (sum edit distances / sum reference word counts, aggregated across batches). Source: NeMo, ESPnet
+     - Log: AED loss, CTC loss, total loss, WER, CER, SER, learning rate, gradient norm, clipping indicator, loss scale, skipped steps
+     - **ErrorRateStats pattern** (Source: SpeechBrain): per-utterance tracking of insertions/deletions/substitutions, alignment ops. SER = 100 * erroneous_sents / scored_sents. CER via same class with `merge_tokens=False`.
+    - Dual-backend logging: W&B (default) or TensorBoard, selected via `logging.backend` in config YAML
+    - Thin `Logger` wrapper: same `log(metrics, step)` interface, calls wandb or SummaryWriter underneath
+ 4. Implement logger (`training/logger.py`):
+    ```python
+    class Logger:
+        def __init__(self, backend, project, name, config):
+            if backend == "wandb":
+                import wandb
+                wandb.init(project=project, name=name, config=config)
+            elif backend == "tensorboard":
+                from torch.utils.tensorboard import SummaryWriter
+                self.writer = SummaryWriter(log_dir=f"runs/{name}")
 
-       def log(self, metrics: dict, step: int):
-           if self.backend == "wandb":
-               wandb.log(metrics, step=step)
-           else:
-               for k, v in metrics.items():
-                   self.writer.add_scalar(k, v, step)
-   ```
-4. Implement checkpointing:
-   - Save every 5K steps: model, optimizer, scheduler, step count, best WER
-   - Retain top-3 by val WER + latest
-   - Auto-resume from latest checkpoint
-5. Implement dynamic chunk training:
-   - Per batch: sample `w_left ∈ [8, 16]`, `w_right ∈ [0, 4]`
-6. Create training config YAML schema:
+        def log(self, metrics: dict, step: int):
+            if self.backend == "wandb":
+                wandb.log(metrics, step=step)
+            else:
+                for k, v in metrics.items():
+                    self.writer.add_scalar(k, v, step)
+    ```
+ 5. Implement checkpointing (`training/checkpoint.py`):
+    - Save every 5K steps (intra-epoch, not just epoch boundaries): model, optimizer, scheduler, step count, best WER
+    - Retain top-5 by val WER + latest
+    - Auto-resume from latest checkpoint
+    - **Checkpoint averaging**: function to average top-N checkpoint state_dicts for final evaluation. ~0.5-1% WER improvement for free. Source: ESPnet, SpeechBrain
+    - **Preemption handling**: catch SIGTERM, save checkpoint before exit. Source: NeMo
+ 6. Implement bucket-shuffle batch sampling (`training/sampler.py`):
+    - Sort training samples into N buckets (e.g., 100) by audio duration
+    - Shuffle within each bucket
+    - Concatenate buckets in order → batch by fixed count
+    - Result: ~30-50% less padding waste, stable GPU memory, no OOM from outliers
+    - Source: NeMo (semi-sorted batching), SpeechBrain (DynamicBatchSampler)
+ 7. Implement SentencePiece lazy loading in tokenizer:
+    - Defer `SentencePieceProcessor` creation to first `encode()` call
+    - Prevents pickle failures with `DataLoader(num_workers > 0)`
+    - Source: ESPnet
+ 8. Implement dynamic chunk training:
+    - Per batch: sample `w_left ∈ [8, 16]`, `w_right ∈ [0, 4]`
+ 9. Create training config YAML schema:
    ```yaml
-   model: {name: v2_tiny, d_model: 320, num_layers: 6, ...}
-   data: {train_manifest: data/manifests/train.jsonl, ...}
-   training: {epochs: 3, batch_size: 16, accum_steps: 8, lr: 2e-3, ...}
-   loss: {ctc_weight: 0.3, label_smoothing: 0.1}
-   augmentation: {spec_augment: true, speed_perturbation: true, musan_noise: true}
-   checkpointing: {save_every: 5000, keep_top: 3}
-   ```
-7. Run **T7: CTC head sanity**:
-   - Random encoder output + real transcript → CTC loss finite, positive, decreases over 50 steps on CTC head alone
-8. Run **T8: Joint loss convergence**:
-   - Train 500 steps with joint loss on 100 clips
-   - Both losses decrease. No NaN.
+    model: {name: v2_tiny, d_model: 320, num_layers: 6, ...}
+    data: {train_manifest: data/manifests/train.jsonl, ...}
+     training: {epochs: 3, batch_size: 16, accum_steps: 8, lr: 2e-3, grad_clip: 5.0, precision: fp16, ...}
+     loss: {ctc_weight: 0.3, label_smoothing: 0.1, interctc_layers: [], interctc_weight: 0.2, ctc_zero_infinity: true}
+     augmentation: {spec_augment: true, speed_perturbation: true, musan_noise: true, narrowband: {enabled: true, max_freq: 4000, prob: 0.1}, warmup_steps: 5000, adaptive_time_mask: true, min_aug: 1, max_aug: 3, parallel_fixed_bs: true}
+    batching: {strategy: bucket_shuffle, num_buckets: 100}
+
+    checkpointing: {save_every: 5000, keep_top: 5, eval_every: 2000, avg_top_n: 5}
+    optimizer: {name: schedulefree, lr: 2e-3}
+    logging: {backend: wandb, project: ru-moonshine, name: v2-tiny-phase1, log_every: 100, eval_every: 2000}
+    ```
+10. Run **T7: CTC head sanity**:
+    - Random encoder output + real transcript → CTC loss finite, positive, decreases over 50 steps on CTC head alone
+11. Run **T8: Joint loss convergence**:
+    - Train 500 steps with joint loss on 100 clips
+    - Both losses decrease. No NaN.
 
 ### Self-Check
 
 - [ ] Training loop runs for 100 steps on random data without error
+- [ ] Non-finite gradient handling: inject NaN loss, verify step is skipped, training continues
 - [ ] Logger shows metrics (W&B dashboard at wandb.ai, or `tensorboard --logdir runs/`)
 - [ ] Switching `logging.backend: tensorboard` works without code changes
 - [ ] Checkpoint saves and loads correctly
 - [ ] Gradient accumulation produces correct effective batch size
+- [ ] Bucket-shuffle sampler groups similar-length samples together
+- [ ] Preemption: SIGTERM during training → checkpoint saved → resume succeeds
 - [ ] T7: CTC loss finite, positive, decreasing
 - [ ] T8: Both AED and CTC losses decrease, no NaN
 
@@ -367,8 +410,9 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 - `training/train.py` — full training loop
 - `training/validate.py` — WER evaluation
-- `training/checkpoint.py` — save/load/resume
+- `training/checkpoint.py` — save/load/resume/average
 - `training/logger.py` — dual-backend logger (wandb / tensorboard, config-selected)
+- `training/sampler.py` — bucket-shuffle batch sampler
 - `configs/train_v2_tiny.yaml` — example training config
 
 ---
@@ -432,8 +476,9 @@ After M6, we have a trained model that can transcribe Russian speech. This model
 3. **Source-level ranking** — rank sources by (error_rate × size), following Whisper's post-training filtering methodology
 4. **Manual inspection** — listen to 20 clips from the worst-ranked sources to determine if errors are from (a) bad transcripts, (b) bad audio, or (c) model weakness
 5. **Remove confirmed bad sources** — only remove entire sources after manual verification, never individual samples
-6. **Audio-transcript alignment check** — flag entries where duration vs text length are wildly mismatched (>2σ from mean chars/second)
-7. **Spot-check 50 random samples** from cleaned data for quality verification
+ 6. **Audio-transcript alignment check** — flag entries where duration vs text length are wildly mismatched (>2σ from mean chars/second)
+ 7. **Top-K worst utterances** — identify the 50 utterances with highest WER for targeted inspection. Group by speaker to find problematic speakers. Source: SpeechBrain `top_wer_utts` / `top_wer_spks`
+ 8. **Spot-check 50 random samples** from cleaned data for quality verification
 
 ### Gates
 
@@ -461,19 +506,21 @@ After M6, we have a trained model that can transcribe Russian speech. This model
 ### Actions
 
 1. Run **T9: Streaming vs non-streaming parity**:
-   - Same audio: (a) encode all frames at once, (b) encode chunk-by-chunk (chunk=32 frames) with state carry-over
-   - Cosine similarity of encoder outputs > 0.99 on overlapping frames
-   - Test for both v2 and v2.1
+    - Same audio: (a) encode all frames at once, (b) encode chunk-by-chunk (chunk=32 frames) with state carry-over
+    - Cosine similarity of encoder outputs > 0.99 on overlapping frames
+    - **Dependency matrix inference**: for each input frame, randomize it and check which output frames change. Produces Boolean matrix `[input_frame, output_frame]`. Verifies no accidental future-frame leakage. Source: SpeechBrain `infer_dependency_matrix`
+    - Test for both v2 and v2.1
 2. Run **T10: TTFT is bounded**:
    - Measure encoder forward time for 1s, 5s, 10s, 30s audio
    - TTFT must be constant (±10%). If it grows linearly, attention is not windowed
 3. Run **T11: KV cache correctness**:
    - Encoder with KV cache (incremental) vs without cache (full recomputation)
    - Logits diff < 1e-5 for 5s and 30s audio
-4. Run **T14: ONNX export smoke test**:
-   - `torch.onnx.export` encoder and decoder separately
-   - Load in ONNX Runtime, run inference
-   - Output diff < 1e-4 vs PyTorch
+ 4. Run **T14: ONNX export smoke test**:
+    - `torch.onnx.export` encoder and decoder separately (NeMo pattern: split subgraphs)
+    - **Module replacement before export**: replace Flash Attention / SDPA with manual attention, any custom ops with standard equivalents. Source: NeMo `export_utils.py`
+    - Load in ONNX Runtime, run inference
+    - Output diff < 1e-4 vs PyTorch
 5. Run **T15: ONNX streaming test**:
    - Export encoder with KV cache inputs/outputs
    - Chunk-by-chunk ONNX inference
@@ -486,6 +533,7 @@ After M6, we have a trained model that can transcribe Russian speech. This model
 ### Self-Check
 
 - [ ] T9: cosine similarity > 0.99 (v2 and v2.1)
+- [ ] T9: dependency matrix shows no future-frame leakage (upper triangle = all False)
 - [ ] T10: TTFT constant ±10% across 1-30s audio
 - [ ] T11: logits diff < 1e-5 with and without cache
 - [ ] T14: ONNX output diff < 1e-4 vs PyTorch
@@ -568,18 +616,23 @@ After M6, we have a trained model that can transcribe Russian speech. This model
    - **Validation WER**: every 2K steps (should decrease, target: converge < 25%)
    - **System metrics** (W&B only): GPU utilization, VRAM usage, GPU temperature, power draw
    - **Gradient norm**: should stay < 100, no spikes
-3. Wait for convergence (3 epochs or early stop)
-4. Select best checkpoint by validation WER
-5. Evaluate best checkpoint:
-   - Greedy WER on validation set
-   - Beam search (width 5) WER on validation set
-   - Non-streaming WER (full attention)
-   - Streaming WER (chunk-by-chunk encoder)
-   - Per-dataset WER (CV vs Golos)
+ 3. Wait for convergence (3 epochs or early stop)
+ 4. Select best checkpoint by validation WER
+ 5. **Checkpoint averaging**: average top-5 checkpoints by val WER, evaluate averaged model
+ 6. Evaluate best + averaged checkpoints:
+    - Greedy WER on validation set
+    - CTC prefix beam search WER (separate blank/non-blank probabilities). Source: SpeechBrain
+    - AED beam search (width 5) WER on validation set
+    - Non-streaming WER (full attention)
+    - Streaming WER (chunk-by-chunk encoder)
+    - Per-dataset WER (CV vs Golos)
+    - **Confidence estimation**: word-level max_prob confidence scores on 500 validation samples. Source: NeMo
 6. Export to ONNX (FP32 + INT8). Run T14/T15 again on final model
 7. Measure streaming TTFT on CPU (MacBook or local)
-8. Run error analysis on 500 validation samples (categorize errors per type from plan Section 10)
-9. Visualize encoder attention patterns on 10 utterances (check for attention sinks)
+ 8. Run error analysis on 500 validation samples (categorize errors per type from plan Section 10):
+    - **Per-token confusion matrix**: build `ClassificationStats` for grapheme-level error analysis (which characters are most confused). Source: SpeechBrain
+    - **CTC posterior trimming**: optionally trim encoder frames where CTC blank prob > 0.95 (5-frame tolerance). Measure decoder speedup vs WER impact. Source: ESPnet
+ 9. Visualize encoder attention patterns on 10 utterances (check for attention sinks)
 
 ### Self-Check
 
@@ -597,8 +650,8 @@ After M6, we have a trained model that can transcribe Russian speech. This model
 
 - Best v2 Tiny checkpoint
 - v2 Tiny ONNX models (FP32 + INT8)
-- Evaluation report: greedy WER, beam WER, streaming WER, non-streaming WER, TTFT
-- Error analysis report (v2 Tiny)
+- Evaluation report: greedy WER, beam WER, streaming WER, non-streaming WER, CER, SER, TTFT
+- Error analysis report (v2 Tiny): per-utterance insertions/deletions/substitutions breakdown
 
 ---
 
@@ -755,7 +808,7 @@ After M6, we have a trained model that can transcribe Russian speech. This model
    training: {epochs: best_from_M12, batch_size: 16, accum_steps: 8, lr: best_from_M12}
    loss: {ctc_weight: best_from_M12, label_smoothing: 0.1}
    regularization: {attention_dropout: 0.1, ffn_dropout: 0.1}
-   augmentation: {spec_augment: true, speed_perturbation: true, musan_noise: true, rir: true}
+   augmentation: {spec_augment: true, speed_perturbation: true, musan_noise: true, rir: true, narrowband: true}
    ```
 3. Monitor closely for first 2K steps (loss should decrease, no NaN, no explosion)
    - W&B: watch from laptop, no SSH needed. TensorBoard: `ssh -L 6006:localhost:6006`

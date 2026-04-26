@@ -116,6 +116,7 @@ x → LayerNorm → Sliding-Window Self-Attention → Residual → LayerNorm →
 ```
 - Layers 0-1 and N-2 to N-1: window (16, 4) — 80ms lookahead
 - Middle layers: window (16, 0) — strictly causal
+- Attention: use `torch.nn.functional.scaled_dot_product_attention` (PyTorch 2.0+). Auto-selects Flash Attention or memory-efficient attention kernel. No external library needed. With graceful fallback to manual attention for debugging. Source: ESPnet, NeMo both use this pattern.
 
 ### 3.3 ru-Moonshine v2.1 (Improved)
 
@@ -210,7 +211,31 @@ The added convolution is depthwise (1 filter per channel), so parameter increase
 
 v2.1 processes 4 of 10 layers at half the frame rate (25Hz), reducing encoder FLOPs by ~20% despite the added conv modules. This means v2.1 should be both more accurate AND faster than v2.
 
-### 3.4 Streaming Decoder Mechanics
+### 3.5 Model Forward Contract
+
+**Source**: ESPnet (`AbsESPnetModel.forward()`).
+
+Both v2 and v2.1 models follow a unified forward contract. The model's `forward()` method returns a tuple `(loss, stats, weight)`:
+
+```python
+def forward(self, **batch) -> Tuple[Tensor, Dict[str, Tensor], Tensor]:
+    # ... encoder, adapter, decoder, loss computation ...
+    stats = {
+        "loss": loss.item(),
+        "loss_aed": loss_aed.item(),
+        "loss_ctc": loss_ctc.item(),
+        "acc": token_accuracy,
+    }
+    return loss, stats, batch_size
+```
+
+- `loss`: scalar tensor for backpropagation
+- `stats`: dict of metrics for logging (detached from computation graph)
+- `weight`: batch size for weighted metric averaging across workers/batches
+
+This contract decouples the training loop from model internals. The training loop calls `loss, stats, weight = model(**batch)`, logs everything from `stats`, and backpropagates `loss`. Adding new metrics requires zero changes to the training loop.
+
+### 3.6 Streaming Decoder Mechanics
 
 The encoder produces streaming outputs via sliding-window attention. The **decoder** must consume these incrementally:
 
@@ -315,13 +340,35 @@ Record versions in a `data/versions.json` manifest. This ensures results are rep
 
 ### Data Mixing
 
-Temperature-based sampling with α=0.7 to prevent overfitting to the dominant/cleanest domain:
+**Temperature-based sampling** (Source: NeMo `ConcatDataset`, Whisper):
 
-```
-p_i ∝ hours_i^0.7
+```python
+p_i = hours_i^(1/temperature)  # normalized across all datasets
 ```
 
-This slightly upweights smaller datasets (SOVA, RuLS) relative to raw proportions, ensuring the model sees enough far-field and telephony audio. Whisper uses this approach.
+| Temperature | Effect |
+|------------|--------|
+| 1.0 | Pure proportional (largest dataset dominates) |
+| 5.0 (NeMo default) | Significantly flattened toward equal sampling |
+| ∞ | Equal sampling regardless of size |
+
+With temperature=5 and datasets of 3000h and 100h: the smaller dataset gets ~20% of samples (vs 3% raw proportional). This prevents the model from overfitting to the dominant domain.
+
+**Power-law category sampling** (Source: ESPnet `CategoryPowerSampler`):
+
+```python
+P(category) = (n_category / N_total)^β * (1 / k_category)
+```
+
+| β | Effect |
+|---|--------|
+| 0 | Strong upsampling of low-resource categories |
+| 0.7 (our default) | Moderate balancing |
+| 1 | Pure proportional to duration |
+
+This is an alternative to temperature sampling with finer-grained control. Supports hierarchical balancing: dataset-level β_D × category-level β_L. Use when mixing >3 datasets with very different sizes.
+
+**Recommendation**: Use temperature=5 (NeMo's default) for Phase 1 (2 datasets). Use power-law sampler if adding more datasets in Phase 2.
 
 Validate mixing by checking per-dataset validation WER during Phase 1. If any dataset's WER is >2x the average, adjust temperature.
 
@@ -375,6 +422,12 @@ L_total = L_AED + α · L_CTC      where α ≈ 0.2-0.3
 
 **Implementation**: One `nn.Linear(enc_dim, vocab_size)` layer + `torch.nn.CTCLoss()`. The CTC head is discarded at inference unless used for the fast path.
 
+**CTC loss details** (Source: ESPnet, NeMo, SpeechBrain):
+- **Blank index**: Use index 0 (ESPnet/SpeechBrain convention). NeMo uses `num_classes` (last index). Either works as long as model output and loss agree.
+- **zero_infinity=True**: Always set this. CTC loss becomes infinite when encoder output length < `2 * target_length - 1` (not enough frames for a valid alignment). PyTorch replaces inf with 0. Source: ESPnet defaults to True.
+- **Reduction**: Use `reduction="none"` then `loss.sum() / batch_size` (ESPnet pattern). NeMo's `mean_volume` mode weights by target length — useful but non-standard.
+- **Label smoothing**: Do NOT apply to CTC loss. Incompatible with CTC's structured blank/non-blank alignment space. Smoothing is for AED decoder only (Section 6.6). No framework applies smoothing to CTC.
+
 **Applicability**: v2 and v2.1. For v2, this is the single most impactful training-only improvement. For v2.1, it compounds with the architectural improvements.
 
 ### 6.2 SpecAugment + Speed Perturbation + Noise Augmentation
@@ -383,14 +436,26 @@ Standard ASR data augmentation:
 
 | Augmentation | Params | Purpose |
 |-------------|--------|---------|
-| Time masking | max 10 frames | Robustness to temporal distortion |
-| Frequency masking | max 8 bins | Robustness to speaker variation |
+| Time masking | adaptive (5% of seq length) | Robustness to temporal distortion, scales to utterance length |
+| Frequency masking | max 15-20 bins | Robustness to speaker variation |
 | Speed perturbation | 0.9x, 1.0x, 1.1x | Effectively 3x training data |
 | MUSAN noise | SNR 0-20dB, 30% of batches | Real-world noise robustness |
 | RIR simulation | Synthetic room responses | Far-field/reverberant conditions |
 | Babble noise | Overlapping speakers | Challenging noise robustness |
+| Narrowband augmentation | Zero freq > 4kHz with p=0.1 | Telephone audio robustness (Source: NeMo) |
+| Dithering | 1e-5 × white noise, training only | Prevents feature extraction edge cases (Source: NeMo) |
 
-**Expected impact**: +2-5% relative WER improvement (SpecAugment alone). Noise/RIR augmentation provides additional robustness that is critical for phone-based deployment but not captured by clean benchmark WER.
+**SpecAugment implementation notes** (Source: third-pass analysis of ESPnet, NeMo, SpeechBrain):
+
+- **Adaptive time masking**: Use float `time_width` (e.g., 0.05 = 5% of sequence length) instead of fixed frame count. Fixed-width masks are too large for short utterances (< 2s) and too small for long ones (> 10s). NeMo and ESPnet both support this. Implementation: `max_mask_len = max(1, int(time_width * seq_len))`.
+- **Vectorized SpecAugment**: Generate all masks in parallel on GPU via batched random tensors instead of per-sample Python loops. NeMo's `use_vectorized_code=True` is 10-50x faster. Implementation: create `(batch, n_masks, 2)` random tensors for mask start/width, then apply via `torch.arange` broadcasting.
+- **Augmentation warmup**: Skip augmentation for the first N optimizer steps. Let the model learn on clean data first, then gradually introduce augmentation. SpeechBrain uses 8K-80K warmup steps depending on model size. Critical for our small data regime (248h). **Implementation**: simple step counter check — only apply augmentation when `global_step >= augment_warmup_steps`. Config: `augmentation.warmup_steps: 5000`.
+- **Random augmentation count**: Instead of always applying all augmentations, randomly select 1-N per batch. Adds stochastic variety. SpeechBrain Loquacious recipe uses `min_augmentations: 1, max_augmentations: 3`. Config: `augmentation.min_aug: 1, augmentation.max_aug: 3`.
+- **Balanced augmentation** (`parallel_augment_fixed_bs`, Source: SpeechBrain `Augmenter`): When applying augmentation in parallel (each augmenter independently to the original signal), fix the total batch size. Each augmenter produces `batch_size // N` examples, maintaining a balanced ratio between original and augmented data. Prevents augmented data from overwhelming the original distribution. Config: `augmentation.parallel_fixed_bs: true`.
+
+**CTC posterior trimming** (Source: ESPnet `trim_by_ctc_posterior`): At inference, trim encoder frames where CTC is confident about blank (prob > 0.95, with 5-frame tolerance margin). Reduces encoder output length for streaming, lowering downstream decoder compute. Optional optimization for Phase 2+.
+
+**Expected impact**: +2-5% relative WER improvement (SpecAugment alone). Noise/RIR augmentation provides additional robustness that is critical for phone-based deployment but not captured by clean benchmark WER. Augmentation warmup is especially important for our small-data regime (248h Phase 1).
 
 ### 6.3 Dynamic Chunk Training
 
@@ -427,7 +492,7 @@ Expected noise rate: 10-30%. Retrain only on filtered subset. Iterate if noise >
 
 **License note**: OpenSTT is CC-BY-NC. Models trained with it can't be used commercially. If commercial use is needed, stick to the 5.4K commercial-safe hours.
 
-### 6.5 Schedule-Free Optimizer
+### 6.5 Schedule-Free Optimizer (Primary) + Warmup-Cosine (Fallback)
 
 Moonshine v2 uses Schedule-Free (Defazio et al., 2024) instead of AdamW with cosine scheduling.
 
@@ -437,6 +502,15 @@ Moonshine v2 uses Schedule-Free (Defazio et al., 2024) instead of AdamW with cos
 
 **Note**: Call `optimizer.train()` / `optimizer.eval()` alongside `model.train()` / `model.eval()`.
 
+**Fallback**: If Schedule-Free underperforms or causes instability, use AdamW with warmup + cosine decay. This is the standard in ESPnet, NeMo, and SpeechBrain — all three frameworks default to some form of warmup schedule:
+- Warmup for N steps (typically 1K-10K)
+- Cosine decay to 0 (or 10% of peak) over total steps
+- Implementation: `torch.optim.lr_scheduler.OneCycleLR` or custom cosine schedule
+
+**Second fallback — TriStageLRSchedule** (Source: SpeechBrain `schedulers.py`, from wav2vec 2.0): Three-phase schedule — linear warmup → constant hold → exponential decay. More configurable than cosine: separate `warmup_steps`, `hold_steps`, `decay_steps`, `init_lr_scale=0.01`, `final_lr_scale=0.05`. Best for training runs where you want to explicitly control the hold phase duration. Use if cosine schedule shows instability during the transition from warmup to decay.
+
+Config switch: `optimizer.name: schedulefree` (default) or `optimizer.name: adamw_cosine` or `optimizer.name: adamw_tristage`.
+
 ### 6.6 Label Smoothing
 
 Standard regularization for autoregressive decoders. Apply label smoothing ε=0.1 to the decoder's cross-entropy loss.
@@ -445,7 +519,112 @@ Standard regularization for autoregressive decoders. Apply label smoothing ε=0.
 
 **Expected impact**: +1-3% relative WER improvement. Nearly free to implement (`CrossEntropyLoss(label_smoothing=0.1)` in PyTorch 2.0+).
 
-### 6.7 Transfer Learning from English Moonshine (Optional)
+### 6.7 Non-Finite Gradient Handling
+
+**Source**: ESPnet, NeMo, SpeechBrain — all three production frameworks implement this.
+
+**What it does**: When a batch produces inf/nan gradients (from data corruption, numerical instability, or mixed precision overflow), skip the optimizer step instead of crashing. SpeechBrain adds a patience counter — training only aborts after N consecutive bad steps.
+
+**Implementation**:
+```
+After loss.backward():
+  grad_norm = clip_grad_norm_(model.parameters(), max_norm)
+  if grad_norm is inf/nan:
+    log warning, zero_grad(), skip optimizer.step()
+    increment bad_step_counter
+    if bad_step_counter > patience (default 5): abort
+  else:
+    reset bad_step_counter
+    optimizer.step()
+```
+
+**Expected impact**: Prevents wasted training runs from a single bad batch. Near-zero cost. Standard in production ASR.
+
+### 6.8 InterCTC (Intermediate CTC Supervision)
+
+**Source**: ESPnet (interctc_weight), NeMo (InterCTCMixin).
+
+**What it does**: Apply CTC loss not only at the final encoder layer, but also at specified intermediate layers. This provides auxiliary supervision throughout the encoder, helping earlier layers learn monotonic audio-text alignments.
+
+**Implementation**: At specified encoder layers (e.g., layers 2 and 4 of 6), add a lightweight CTC head (`nn.Linear(enc_dim, vocab_size)`). Total loss:
+```
+L = L_AED + α · L_CTC_final + β · Σ(L_CTC_intermediate)
+```
+Where β = 0.1-0.3 (lower than α for final CTC).
+
+**Expected impact**: +2-5% relative WER improvement. Helps convergence, especially with limited data. Optional — enable if base CTC helps but model convergence is slow.
+
+**Config**: `loss.interctc_layers: [2, 4]`, `loss.interctc_weight: 0.2`.
+
+### 6.9 Length-Based Batch Sampling
+
+**Source**: ESPnet (LengthBatchSampler / batch_bins), NeMo (semi-sorted batching), SpeechBrain (DynamicBatchSampler with max_batch_length).
+
+**What it does**: Instead of fixed `batch_size=N`, batch samples so that total audio duration per batch is approximately constant. Group samples into buckets by duration, shuffle within buckets, then batch. This minimizes padding waste (short utterances no longer waste GPU memory) and prevents OOM from long utterances.
+
+**Implementation**:
+1. Sort training samples by audio duration
+2. Group into N buckets (e.g., 50-200 buckets)
+3. Shuffle within each bucket
+4. Concatenate buckets in order
+5. Batch by fixed count (similar-length items end up together)
+
+This is the simpler alternative to full `batch_bins`-style batching. The bucket-shuffle approach is used by NeMo and SpeechBrain.
+
+**Expected impact**: ~30-50% more samples per batch on average (less padding waste), more stable GPU memory usage, no OOM risk from outlier long utterances.
+
+**Config**: `data.batching: bucket_shuffle`, `data.num_buckets: 100`.
+
+### 6.10 Checkpoint Averaging (Top-N Best)
+
+**Source**: ESPnet (`average_nbest_models`), SpeechBrain (`average_checkpoints`).
+
+**What it does**: After training completes, average the `state_dict`s of the top-N checkpoints (by validation WER). This is model weight averaging — a form of ensembling without inference cost.
+
+**Implementation**:
+```
+1. Identify top-5 checkpoints by validation WER
+2. Load each checkpoint's model state_dict
+3. Average all parameters element-wise
+4. Save as model_avg.pt
+```
+
+**Expected impact**: ~0.5-1% absolute WER improvement. Free — no retraining needed. Standard in production ASR systems.
+
+### 6.11 SentencePiece Lazy Loading
+
+**Source**: ESPnet (`sentencepiece_tokenizer.py`).
+
+**What it does**: Defer SentencePiece processor initialization to first use, not in `__init__()`. This avoids pickle failures when the tokenizer is used in multiprocessing DataLoader workers.
+
+**Implementation**: In tokenizer wrapper, set `self._processor = None` in `__init__()`. Create `SentencePieceProcessor` on first `encode()` call:
+```python
+def encode(self, text):
+    if self._processor is None:
+        self._processor = spm.SentencePieceProcessor(self._model_path)
+    return self._processor.encode(text)
+```
+
+**Expected impact**: Prevents `DataLoader(num_workers > 0)` crashes. Zero performance cost.
+
+### 6.12 Preemption Handling (SIGTERM → Save Checkpoint)
+
+**Source**: NeMo (`PreemptionCallback`).
+
+**What it does**: Catch SIGTERM/SIGINT signals and save a checkpoint before exit. Useful for spot instances, manual stops, and OOM killer.
+
+**Implementation**:
+```python
+import signal
+def checkpoint_and_exit(signum, frame):
+    save_checkpoint(model, optimizer, step, path="checkpoint_interrupted.pt")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, checkpoint_and_exit)
+```
+
+**Expected impact**: Prevents lost training progress on interrupted runs. Near-zero cost.
+
+### 6.13 Transfer Learning from English Moonshine (Optional)
 
 English Moonshine was trained on 300K hours. The audio preprocessor and encoder learn acoustic features that transfer across languages. Initialize from English weights:
 
@@ -459,12 +638,58 @@ English Moonshine was trained on 300K hours. The audio preprocessor and encoder 
 
 **Risk**: The decoder's new random embeddings may cause instability early in fine-tuning. Mitigate with LR warmup and lower initial LR for transferred layers.
 
-### 6.8 Weight Initialization
+### 6.14 Weight Initialization
 
-- **From scratch**: Kaiming normal for attention/FFN layers. Uniform init for embeddings. Small init for output projection (stabilizes early training).
-- **Transfer learning**: Initialize from English Moonshine checkpoint. Random init only for new layers (embedding matrix, output projection).
+**Source**: ESPnet (`espnet2/torch_utils/initialize.py`).
 
-### 6.9 Summary: Training Tricks Impact
+Centralized initialization function applied after model construction:
+
+1. **Weight matrices (dim > 1)**: Xavier uniform (default). Alternatives: xavier normal, kaiming uniform/normal, normal(std=0.02)
+2. **Biases**: Zero initialization for all 1D parameters
+3. **Embedding, LayerNorm, GroupNorm**: `reset_parameters()` (re-overrides global init for these layers)
+4. **Output projection**: Small init (e.g., normal(0, 0.02)) to stabilize early training logits
+5. **Custom per-module**: Modules can define `init_fn()` for special cases
+
+**From scratch**: Apply above defaults. **Transfer learning**: Initialize from English Moonshine checkpoint. Random init only for new layers (embedding matrix, output projection).
+
+### 6.15 Gradient Clipping
+
+**Source**: ESPnet (`abs_task.py:581-592`, `trainer.py:720-724`).
+
+Standard gradient clipping to prevent exploding gradients. ESPnet defaults for ASR:
+- `grad_clip = 5.0` (max L2 norm)
+- `grad_clip_type = 2.0` (L2 norm, via `torch.nn.utils.clip_grad_norm_`)
+
+Applied after `scaler.unscale_()` (for AMP) and before `scaler.step()` — correct order. ESPnet also logs a clipping indicator: `100` if clipped, `0` if not — useful for monitoring clipping frequency.
+
+**BF16 training**: No GradScaler needed. BF16 has the same dynamic range as FP32 (8 exponent bits). Use `torch.autocast("cuda", dtype=torch.bfloat16)` without `GradScaler`. Source: ESPnet creates a scaler even for BF16 (unnecessary), all three frameworks agree it's not needed.
+
+**FP16 training**: GradScaler IS required. Log `scaler.get_scale()` per step for instability diagnosis (loss scale crashing to tiny values = gradient explosion).
+
+**Expected impact**: Prevents training divergence. Near-zero cost. Standard in all three frameworks.
+
+### 6.17 Implementation Gotchas (from Framework Analysis)
+
+These are non-obvious implementation details that cause subtle bugs in ASR training:
+
+**Forced FP32 for feature extraction**: The STFT and mel filterbank operations MUST run in float32 even under mixed precision (AMP). Both NeMo and SpeechBrain explicitly disable autocast for these operations. fp16 precision in mel filterbank multiplication causes NaN. Implementation:
+```python
+with torch.amp.autocast(device_type, enabled=False):
+    x = x.float()  # Force float32
+    mel = self.mel_filterbank(self.stft(x))
+```
+
+**Subsampling mask propagation**: When using conv2d subsampling (stride 2), the attention mask must be adjusted to match. Each conv layer with kernel 3, stride 2 removes 2 boundary frames and subsamples by 2: `mask[:, :, :-2:2]`. Forgetting this causes attention to attend to padded positions. Source: ESPnet `subsampling.py`.
+
+**TooShortUttError**: Audio shorter than the subsampling layer's minimum input length (e.g., 7 frames for conv2d 4x subsampling) will produce incorrect output. Add a minimum duration check in the data loader and skip or pad these samples. Source: ESPnet.
+
+**`set_to_none=True` in `zero_grad()`**: Always use `optimizer.zero_grad(set_to_none=True)` instead of `optimizer.zero_grad()`. Releases gradient tensor memory instead of zeroing — saves ~20% peak memory for the gradient buffer. Source: SpeechBrain.
+
+**QK Normalization** (optional): Apply LayerNorm to Q and K tensors before computing attention scores. Stabilizes training for large models. Implementation: `self.q_norm = LayerNorm(d_k)`. Source: ESPnet.
+
+**Gradient noise injection** (optional): Add decaying Gaussian noise to gradients after backward. `sigma = eta / (step // duration + 1)^0.55`. Can improve generalization by preventing sharp minima. Source: ESPnet (disabled by default).
+
+### 6.15 Summary: Training Tricks Impact
 
 | Trick | WER Impact | Effort | Phase | Applies To |
 |-------|-----------|--------|-------|------------|
@@ -474,12 +699,35 @@ English Moonshine was trained on 300K hours. The audio preprocessor and encoder 
 | Label smoothing (ε=0.1) | +1-3% rel. | Low | 1 | v2 + v2.1 |
 | Pseudo-labeling | +10-30% rel. | Medium | 3 | v2 + v2.1 |
 | Schedule-Free optimizer | Simplifies tuning | Low | 1 | v2 + v2.1 |
+| Warmup + cosine LR (fallback) | Alternative to Schedule-Free | Low | 1 | v2 + v2.1 |
 | Transfer learning (optional) | +10-30% rel. | Low | 1b | v2 + v2.1 |
 | Dropout + attention dropout | +1-3% rel. | Low | 1 | v2 + v2.1 |
+| Non-finite gradient handling | Prevents crashed runs | Low | 1 | v2 + v2.1 |
+| InterCTC supervision | +2-5% rel. | Low | 1 | v2 + v2.1 |
+| Length-based batch sampling | ~30-50% more eff. batches | Low | 1 | v2 + v2.1 |
+| Checkpoint averaging (top-N) | +0.5-1% abs. | Low | 1 | v2 + v2.1 |
+| SentencePiece lazy loading | Prevents DL crashes | Low | 1 | v2 + v2.1 |
+| Preemption handling | Prevents lost progress | Low | 1 | v2 + v2.1 |
+| Narrowband augmentation | Phone audio robustness | Low | 1 | v2 + v2.1 |
+| Forced FP32 for features | Prevents NaN under AMP | Low | 1 | v2 + v2.1 |
+| SDPA / Flash Attention | 2-4x faster attention | Low | 1 | v2 + v2.1 |
+| Augmentation warmup | Critical for small data | Low | 1 | v2 + v2.1 |
+| Adaptive time masking | Better SpecAug for variable-length | Low | 1 | v2 + v2.1 |
+| Vectorized SpecAugment | 10-50x faster mask generation | Low | 1 | v2 + v2.1 |
+| Balanced augmentation (parallel_fixed_bs) | Prevents augmented data dominance | Low | 1 | v2 + v2.1 |
+| CTC posterior trimming | Reduces streaming decoder compute | Low | 2 | v2 + v2.1 |
+| Power-law / temperature data mixing | Balanced multi-dataset sampling | Low | 1 | v2 + v2.1 |
+| Streaming dependency matrix verification | Catches future-frame leakage | Low | 1 | v2 + v2.1 |
+| Per-token confusion matrix for error analysis | Targeted diagnostic | Low | 2 | v2 + v2.1 |
+| Gradient clipping (norm=5.0) | Prevents divergence | Low | 1 | v2 + v2.1 |
+| TriStage LR schedule (second fallback) | Alternative LR schedule | Low | 1 | v2 + v2.1 |
+| Gradient checkpointing (per-layer) | 30-60% activation VRAM savings | Low | 3 | v2 + v2.1 |
+| CTC zero_infinity=True | Handles too-short inputs gracefully | Low | 1 | v2 + v2.1 |
+| ErrorRateStats with SER+CER+per-utterance | Rich evaluation metrics | Low | 1 | v2 + v2.1 |
 
 ---
 
-### 6.10 Regularization
+### 6.16 Regularization
 
 English Moonshine's 300K hours provided implicit regularization. With 5.4K hours, explicit regularization is needed to prevent overfitting to training speakers and acoustic conditions.
 
@@ -571,6 +819,10 @@ Export encoder and decoder as separate ONNX graphs. Apply graph-level operator f
 | Speculative decoding | 3-4x decoder speedup | +34M (draft model) | 3 | v2 + v2.1 |
 | ONNX operator fusion | 20-40% faster | None | 1 | v2 + v2.1 |
 | Beam search + LM fusion | None (more compute) | +LM (~50MB) | 2 | v2 + v2.1 |
+| CUDA graphs for decoding | 2-4x faster GPU decode | None | 2 | v2 + v2.1 |
+| Streaming decoding architecture | Enables real-time | None | 1 | v2 + v2.1 |
+| Hallucination detection | Prevents streaming artifacts | None | 1 | v2 + v2.1 |
+| Confidence estimation | Quality metadata | None | 2 | v2 + v2.1 |
 
 ### 7.6 Decoding Strategy
 
@@ -580,17 +832,111 @@ The plan already trains a KenLM on Russian Wikipedia for pseudo-label filtering 
 
 | Mode | Description | When to Use |
 |------|-------------|-------------|
-| Greedy | argmax at each decoder step | Phase 1 baseline, streaming where latency is critical |
-| Beam search (width 5-8) | Explore top-K hypotheses | Non-streaming mode, accuracy-focused |
+| CTC greedy | argmax + collapse repeats + remove blanks | Phase 1 baseline, ultra-low-latency streaming |
+| AED greedy | argmax at each decoder step | Phase 1 baseline, streaming where latency is critical |
+| CTC prefix beam search | Beam search with separate blank/non-blank probabilities (Source: SpeechBrain `CTCPrefixBeamSearcher`) | Non-streaming, CTC-only path |
+| AED beam search (width 5-8) | Explore top-K hypotheses | Non-streaming mode, accuracy-focused |
 | Beam + shallow LM fusion | Beam search with external KenLM log-prob weighted into hypothesis scoring | Production deployment, both streaming and non-streaming |
 
+**Scorer interface pattern** (Source: ESPnet `BeamSearch`, SpeechBrain `ScorerBuilder`): Decoders use a modular scorer architecture — each scorer (decoder, CTC, LM, length bonus, coverage) implements `score_full()` (score all vocab tokens) or `score_partial()` (score only top-K candidates). Scorers are combined with weights: `total = w1*decoder + w2*ctc + w3*lm + w4*length`. This decouples decoding from model architecture — adding a new scorer requires zero changes to the beam search loop.
+
+**CTC beam pruning heuristics** (Source: SpeechBrain `CTCBeamSearcher`):
+- `beam_prune_logp` (default -10.0): Remove beams with score < max_score + threshold
+- `token_prune_min_logp` (default -5.0): Only consider tokens with logit > threshold
+- `blank_skip_threshold` (default 1.0): Skip frame entirely if blank probability exceeds threshold
+- `prune_history` (default True): Merge beams with same n-gram history to reduce computation
+
 **LM fusion weight**: Tune on validation set (typical range 0.1-0.3). The KenLM log-probability is interpolated with the model's token log-probability: `score = model_score + λ · lm_score`.
+
+**GPU-resident N-gram LM** (Source: NeMo `NGramGPULanguageModel`): For edge deployment, the N-gram LM can be implemented as a PyTorch model with weights as `nn.Parameter` and Triton kernel acceleration. This enables on-device shallow fusion without KenLM C++ dependency — the LM runs entirely on GPU alongside the ASR model. Exportable as part of the ONNX graph.
 
 **Expected impact**: +10-15% relative WER improvement for beam+LM over greedy. Russian benefits particularly due to rich inflection and phonetically similar case endings where LM context helps disambiguate.
 
 **Streaming latency note**: Beam search adds decoder latency (K sequential decoder steps per beam position). For streaming where decoder latency budget is tight, use greedy or beam width 3. For non-streaming, use beam width 8 + LM.
 
 **Reporting**: Always report both greedy and beam+LM WER to quantify the decoding strategy's contribution.
+
+### 7.7 Streaming Decoding Architecture
+
+**Source**: ESPnet `BatchBeamSearchOnline`, NeMo `ClippedCTCGreedyDecoder`, SpeechBrain `StreamingASR`.
+
+Streaming decoding requires stateful decoding that processes audio chunk-by-chunk while maintaining coherence. Key patterns from production frameworks:
+
+**Block/Hop/Lookahead** (Source: ESPnet): Streaming decoding processes audio in blocks. For each block:
+- `block_size`: Number of encoder frames per chunk (e.g., 32 frames = 640ms at 50Hz)
+- `hop_size`: Stride between chunks (≤ block_size for overlap)
+- `look_ahead`: Number of future frames available within each block (corresponds to encoder lookahead window)
+
+**Repetition detection** (Source: ESPnet `BatchBeamSearchOnline`): In streaming mode, the decoder may produce repeated tokens across chunk boundaries. Detection: if the last N emitted tokens are identical (N=4 default), suppress further emission. This prevents `the the the the` loops.
+
+**Hold-N mechanism** (Source: ESPnet): Hold back N tokens from output between chunks. The held tokens may be revised when more context arrives. This trades output latency for accuracy — held tokens are emitted only when the next chunk confirms them.
+
+**Incremental decoding** (Source: ESPnet): Between chunks, prune all but the top-1 hypothesis. This resets beam state for the next chunk, preventing beam accumulation. Optional — can keep full beam for better accuracy at cost of memory.
+
+**Hallucination detection** (Source: NeMo `GreedyBatchedStreamingAEDComputer`): Three pattern detectors catch streaming artifacts:
+1. `a a a a` — 4+ consecutive identical tokens
+2. `a b a b a b` — alternating pair repeated 3+ times
+3. `a b c a b c a b c` — triple pattern repeated 2+ times
+
+When detected, suppress the hallucinated tokens. Simple but critical for streaming reliability.
+
+**Partial hypothesis management** (Source: NeMo): Both CTC and AED decoders support `partial_hypotheses` parameter — the decoded text state from the previous chunk, enabling continuation across chunks without re-decoding the entire history.
+
+### 7.8 Confidence Estimation
+
+**Source**: NeMo `asr_confidence_utils.py`.
+
+Word-level confidence scores provide quality indicators for edge deployment. Useful for: rejecting low-confidence transcriptions, triggering re-recording prompts, or flagging segments for human review.
+
+**Confidence methods**:
+
+| Method | Description | Complexity |
+|--------|-------------|-----------|
+| `max_prob` | Maximum token probability per word | Simple |
+| `entropy_gibbs` | H_α = -sum(p^α · log(p^α)) | Medium |
+| `entropy_tsallis` | 1/(α-1) · (1 - sum(p^α)), default α=0.33 | Medium |
+| `entropy_renyi` | 1/(1-α) · log2(sum(p^α)) | Medium |
+
+**Aggregation**: Frame → token (exclude blanks) → word (mean/min/max/prod of token scores).
+
+**Normalization**: Linear or exponential mapping to [0, 1].
+
+**Implementation**: Per-word confidence computed during decoding with minimal overhead. Store as metadata alongside transcription output.
+
+### 7.9 CUDA Graphs for Decoding
+
+**Source**: NeMo `GreedyBatchedCTCInfer`.
+
+CUDA graphs capture the entire GPU computation graph and replay it, eliminating kernel launch overhead. For decoding (which has small, repetitive operations), this provides significant speedup.
+
+**Three-tier fallback**:
+1. `FULL_GRAPH`: Full CUDA graphs with conditional while-loop nodes via NVRTC compilation (fastest, requires `cuda-python`)
+2. `NO_WHILE_LOOPS`: Partial CUDA graphs for inner ops, Python while-loop control (good, no extra deps)
+3. `NO_GRAPHS`: Pure PyTorch fallback (always works)
+
+**Applicability**: Best for fixed-shape inference (batch_size=1, known max_length). Requires warmup run to capture graph. Graph recapture needed if shapes change.
+
+**Expected impact**: 2-4x decoding speedup on GPU. Not applicable to CPU inference.
+
+### 7.10 ONNX Export Patterns
+
+**Source**: NeMo `Exportable` base class, `rnnt_greedy_decoding.py` (ONNX/TorchScript variants).
+
+**Key finding**: ESPnet and SpeechBrain have **zero export infrastructure**. Only NeMo has production ONNX/TorchScript export. Our export approach follows NeMo's patterns.
+
+**Encoder/decoder split export**: Export encoder and decoder as separate ONNX graphs. The greedy/beam decoding loop runs outside the model in the inference runtime (Python, C++, or ONNX Runtime). This is the standard NeMo deployment pattern.
+
+**Module replacement for ONNX compatibility** (Source: NeMo `export_utils.py`): Custom CUDA kernels, Apex fused ops, and Flash Attention don't export to ONNX. NeMo replaces them before export:
+- `FusedLayerNorm` (Apex) → `nn.LayerNorm`
+- `MixedFusedRMSNorm` → `TorchRMSNorm`
+- Fused softmax → standard `nn.Softmax`
+- Parallel linear layers → standard `nn.Linear`
+
+**Dynamic shape handling**: Derived from NeMo's `NeuralType` system. For our project: explicit `dynamic_axes` parameter in `torch.onnx.export()` for variable-length sequences.
+
+**torch.compile alternative** (Source: SpeechBrain): `torch.compile` with configurable mode/fullgraph/dynamic shapes. Alternative to ONNX when using PyTorch runtime (e.g., server-side). Simpler than ONNX export but requires PyTorch at inference time.
+
+**Verification**: After export, run ONNX Runtime inference and compare output diff < 1e-4 vs PyTorch. NeMo uses `CUDAExecutionProvider` > `CPUExecutionProvider` fallback chain.
 
 ---
 
@@ -682,13 +1028,17 @@ Day 6-8:  T16, T17, T18  (scale-up readiness — validates before cloud spend)
 
 ### Training Infrastructure
 
-**Checkpoint policy**: Save every 5K steps. Retain top-3 by validation WER + latest. Auto-resume from latest on restart. Storage estimate: ~250MB per Small BF16 checkpoint, ~5GB total per run.
+**Checkpoint policy**: Save every 5K steps. Retain top-3 by validation WER + latest. Auto-resume from latest on restart. Storage estimate: ~250MB per Small BF16 checkpoint, ~5GB total per run. **Intra-epoch checkpointing**: also save every N steps within an epoch (not just epoch boundaries) — for our 156K-sample training set, a single epoch can be hours of work. **Checkpoint averaging**: after training, average the top-5 checkpoints by validation WER for final evaluation (Section 6.10). **Preemption handling**: catch SIGTERM and save checkpoint before exit (Section 6.12).
 
-**Validation during training**: Evaluate WER on validation set every 2K steps via CTC greedy decoding. Log WER alongside loss. Select checkpoints by WER, not loss. Early stopping: abort if WER stops improving for 3 consecutive evaluations (patience = 6K steps).
+**Validation during training**: Evaluate WER on validation set every 2K steps via CTC greedy decoding. Log WER alongside loss. Select checkpoints by WER, not loss. Early stopping: abort if WER stops improving for 3 consecutive evaluations (patience = 6K steps). WER is computed as numerator/denominator (sum of edit distances / sum of reference word counts) — aggregated across all batches in the epoch, not averaged per-batch. This is the standard pattern in NeMo and ESPnet for distributed-safe WER computation.
 
-**Effective batch size**: Target 128-256 via gradient accumulation. On H100 with Small batch=16 per GPU, accumulation steps = 8-16. On 3090 with Small batch=8, accumulation steps = 16-32.
+**Effective batch size**: Target 128-256 via gradient accumulation. On H100 with Small batch=16 per GPU, accumulation steps = 8-16. On 3090 with Small batch=8, accumulation steps = 16-32. Gradient accumulation divides loss by `accum_steps` before backward — this is critical for correct gradient scaling (standard in all three major ASR frameworks).
 
-**Distributed training**: Phase 1-2 (Tiny/Small on 3090 or single H100): single GPU with gradient accumulation. Phase 3 Medium (245M): if single H100 OOM, wrap model with PyTorch FSDP and gradient checkpointing — no architecture changes needed.
+**Batch sampling**: Use bucket-shuffle batching (Section 6.9) instead of fixed `batch_size`. Sort samples into buckets by duration, shuffle within buckets, then batch. This gives ~30-50% more effective samples per batch by reducing padding waste.
+
+**Distributed training**: Phase 1-2 (Tiny/Small on 3090 or single H100): single GPU with gradient accumulation. Phase 3 Medium (245M): DDP should work on 24GB+ GPUs for ASR-scale models (all three frameworks use DDP for models up to ~600M). If OOM, first try gradient checkpointing (30-60% activation memory savings, ~30% slower — ESPnet has per-layer checkpointing in E-Branchformer encoder and Transformer decoder). FSDP is only needed for >1B parameters (LLM-scale). Source: ESPnet, NeMo, SpeechBrain all use DDP for ASR models.
+
+**BF16 vs FP16**: Use BF16 on H100 (native support). BF16 does NOT require GradScaler — same dynamic range as FP32 (8 exponent bits). FP16 on 3090 requires GradScaler. Config: `training.precision: bf16` (H100) or `training.precision: fp16` (3090).
 
 **Experiment tracking**: Support both Weights & Biases (wandb) and TensorBoard, selectable via config. Default: W&B.
 
@@ -737,8 +1087,11 @@ Logged every training step:
 | `loss/total` | Total loss (AED + α·CTC) | Should decrease monotonically. Plateau = convergence. Spike = instability |
 | `loss/aed` | Decoder cross-entropy | Decreases slower than CTC. Plateau at ~1-3 is normal |
 | `loss/ctc` | CTC loss | Should decrease fast early (encoder learns alignments quickly) |
-| `train/grad_norm` | Gradient L2 norm | Should stay < 100. Spikes > 1000 = learning rate too high or data issue |
+| `train/grad_norm` | Gradient L2 norm | Should stay < 100. Spikes > 1000 = learning rate too high or data issue. Inf/NaN = bad batch (should be caught by non-finite gradient handler) |
+| `train/grad_clipped` | Binary (100/0) | Whether gradient was clipped (ESPnet pattern). Frequent clipping = grad_clip too low or LR too high |
+| `train/loss_scale` | GradScaler loss scale (FP16 only) | Crashing to tiny values = gradient explosion. Not applicable for BF16 |
 | `train/lr` | Learning rate | Schedule-Free auto-adapts. Should show decay pattern |
+| `train/skipped_steps` | Count of skipped optimizer steps | Should be 0 or near-0. Increasing = systematic data/precision problem |
 
 Logged every 2K steps:
 
@@ -748,6 +1101,7 @@ Logged every 2K steps:
 | `val/wer_cv` | WER on Common Voice subset | Track per-dataset to catch domain imbalance |
 | `val/wer_golos` | WER on Golos subset | Far-field WER. If >> val/wer, need more far-field data/augmentation |
 | `val/cer` | Character error rate | Should track WER. Divergence = morphological issues |
+| `val/ser` | Sentence error rate | % of utterances with any error. Useful for deployment quality assessment |
 
 Auto-captured system metrics (W&B only — TensorBoard requires manual logging):
 
@@ -961,6 +1315,12 @@ After each training phase, run error categorization on 500+ validation samples. 
 
 Identify top-3 error categories by frequency after each phase. Target next phase improvements toward those categories. One-time script: word-level alignment + rule-based categorization for Russian.
 
+**Evaluation metrics API** (Source: SpeechBrain `ErrorRateStats`, `edit_distance.py`):
+- Use `ErrorRateStats(merge_tokens=True, space_token="_")` for WER, `ErrorRateStats(merge_tokens=False)` for CER — same class, different tokenization.
+- Per-utterance tracking: each entry includes `insertions`, `deletions`, `substitutions`, `num_edits`, `WER`, `alignment` ops (eq/ins/del/sub).
+- **SER** (Sentence Error Rate): `100.0 * num_erroneous_sents / num_scored_sents` — utterances with any error.
+- **WeightedErrorRateStats**: supports custom cost functions per edit type. `EmbeddingErrorRateSimilarity` weights substitutions by embedding cosine similarity — useful for Russian where case-ending errors are less severe than phonetic errors.
+
 ### Benchmarking Protocol
 
 Latency claims are reproducible only with a defined methodology:
@@ -1166,11 +1526,18 @@ All at 50Hz
 
 Training tricks (shared):                 Training tricks (shared):
 ✓ CTC auxiliary loss                      ✓ CTC auxiliary loss
+✓ InterCTC (intermediate layer CTC)       ✓ InterCTC (intermediate layer CTC)
 ✓ SpecAugment + speed pert. + noise       ✓ SpecAugment + speed pert. + noise
 ✓ Dynamic chunk training                  ✓ Dynamic chunk training
-✓ Schedule-Free optimizer                 ✓ Schedule-Free optimizer
+✓ Schedule-Free optimizer (AdamW fallback)✓ Schedule-Free optimizer (AdamW fallback)
 ✓ Label smoothing (ε=0.1)                ✓ Label smoothing (ε=0.1)
 ✓ Dropout (attention 0.1, FFN 0.1)       ✓ Dropout (attention 0.1, FFN 0.1, drop path 0.1)
+✓ Non-finite gradient handling            ✓ Non-finite gradient handling
+✓ Bucket-shuffle batch sampling           ✓ Bucket-shuffle batch sampling
+✓ Checkpoint averaging (top-5)           ✓ Checkpoint averaging (top-5)
+✓ Intra-epoch checkpointing              ✓ Intra-epoch checkpointing
+✓ Preemption handling (SIGTERM)          ✓ Preemption handling (SIGTERM)
+✓ (loss, stats, weight) forward contract ✓ (loss, stats, weight) forward contract
 ✓ Pseudo-labeling pipeline                ✓ Pseudo-labeling pipeline
 ○ Transfer learning (optional)            ○ Transfer learning (optional)
 
@@ -1211,6 +1578,11 @@ Existing moonshine repo                   Custom fork
 
 ### Code
 - Moonshine GitHub: https://github.com/moonshine-ai/moonshine (MIT license)
+
+### Framework Analysis (Best Practices)
+- ESPnet2: ClassChoices pattern, (loss, stats, weight) contract, LengthBatchSampler, InterCTC, checkpoint averaging, non-finite gradient handling, WarmupLR scheduler, gradient clipping (norm=5.0), gradient checkpointing (per-layer), CTC zero_infinity, distributed iterator-stop sync
+- NeMo (NVIDIA): StreamingEncoder mixin, semi-sorted batching, WER numerator/denominator aggregation, preemption handling, multi-context attention training, InterCTCMixin, EMA (for generative models only — not ASR), mean_volume CTC reduction
+- SpeechBrain: DynamicChunkTrainConfig for unified streaming/offline, checkpoint averaging, non-finite loss patience, bucket-shuffle DynamicBatchSampler, HyperPyYAML config, ErrorRateStats with SER/CER/per-utterance breakdown, TriStageLRSchedule with hold phase, LinearNoamScheduler
 
 ### Review History
 - See MOONSHINE_DS_COMMENTS.md for external review comments
