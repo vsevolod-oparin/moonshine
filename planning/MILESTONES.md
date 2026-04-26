@@ -15,15 +15,15 @@ Concrete step-by-step plan. Each milestone is a checkpoint with a gate — do no
 ## Dependency Graph
 
 ```
-M1 ──→ M2 ──→ M3 ──→ M4 ──→ M5 ──→ M6 ──→ M7 ──→ M8
-                                                             │
-                                    M9 ←─────────────────────┘
-                                     │
-                                    M10 ──→ M11 ──→ M12 ──→ M13 ──→ M14
-                                                                    │
-                                                    M15 ←───────────┘
-                                                     │
-                                              M16 ←──┘ ← (optional) M17/M18
+M1 ──→ M2 ──→ M3 ──→ M4 ──→ M5 ──→ M6 ──→ M6.5 ──→ M7 ──→ M8
+                                                                  │
+                                      M9 ←───────────────────────┘
+                                       │
+                                      M10 ──→ M11 ──→ M12 ──→ M13 ──→ M14
+                                                                       │
+                                                       M15 ←──────────┘
+                                                        │
+                                                 M16 ←──┘ ← (optional) M17/M18
 ```
 
 ---
@@ -170,7 +170,7 @@ Corpus: 103K unique sentences (CV21 ru: 122K, RuLS: 57K, deduplicated).
 
 ### Actions
 
-1. Download all datasets:
+1. Download all datasets (see `planning/DATASETS.md` for full availability tracker):
    - Common Voice 21 ru: `artyomboyko/common_voice_21_0_ru` on HuggingFace (validated split has 122K clips; CV19 requires license acceptance on their website and isn't directly on HF — CV21 is the accessible equivalent)
    - Golos: `SberDevices/Golos` is empty on HuggingFace. Download from Sber's original source (e.g. `bond005/sberdevices_golos_*` subsets, or manual from sber.ru). ~1,240 hours when obtained.
    - MLS ru: `facebook/multilingual_librispeech` — **Note**: Russian config doesn't exist in this dataset. Available configs: dutch, french, german, italian, polish, portuguese, spanish. Omit or find alternative.
@@ -414,12 +414,49 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 ---
 
+## M6.5: Data Quality Assessment (Model-Based)
+
+**Machine**: Local 3090 (need trained model from M6)
+**Time**: 1-2 days
+**Cost**: $0
+**Prerequisites**: M6
+
+### Rationale
+
+After M6, we have a trained model that can transcribe Russian speech. This model is the best tool for evaluating training data quality — far more reliable than regex heuristics which produce false positives. This milestone uses the model to score its own training data and identify low-quality sources before scaling up in M8.
+
+### Actions
+
+1. **Run inference on all training data** — use the M6 overfitted model to transcribe all 156K train clips
+2. **Compute WER per source** — calculate word error rate between model output and ground truth transcript, grouped by dataset (cv21, ruls) and by CV21 speaker
+3. **Source-level ranking** — rank sources by (error_rate × size), following Whisper's post-training filtering methodology
+4. **Manual inspection** — listen to 20 clips from the worst-ranked sources to determine if errors are from (a) bad transcripts, (b) bad audio, or (c) model weakness
+5. **Remove confirmed bad sources** — only remove entire sources after manual verification, never individual samples
+6. **Audio-transcript alignment check** — flag entries where duration vs text length are wildly mismatched (>2σ from mean chars/second)
+7. **Spot-check 50 random samples** from cleaned data for quality verification
+
+### Gates
+
+- [ ] WER distribution plotted per dataset and per CV21 speaker
+- [ ] Bottom 5% of sources manually inspected and labeled (bad data / model weakness)
+- [ ] No more than 5% of training data removed
+- [ ] 50-sample spot-check: ≤2 samples flagged (≤4% error rate)
+
+### Deliverables
+
+- `scripts/evaluate_training_data.py` — model-based data quality scorer
+- `data/quality_report.json` — per-source WER, flags, removal decisions
+- Updated `data/manifests/{train,val}.jsonl` with confirmed bad sources removed
+- Quality report document in `planning/`
+
+---
+
 ## M7: Streaming Correctness + ONNX Export
 
 **Machine**: Local 3090
 **Time**: 1-2 days
 **Cost**: $0
-**Prerequisites**: M6
+**Prerequisites**: M6, M6.5
 
 ### Actions
 
@@ -920,7 +957,8 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 | M4: Architecture | 1-2d | 3090 | $0 | 3-5d, $0 |
 | M5: Training Loop | 1-2d | 3090 | $0 | 4-7d, $0 |
 | M6: Overfit Check | 1-2d | 3090 | $0 | 5-9d, $0 |
-| M7: Streaming + ONNX | 1-2d | 3090 | $0 | 6-11d, $0 |
+| M6.5: Data Quality | 1-2d | 3090 | $0 | 6-11d, $0 |
+| M7: Streaming + ONNX | 1-2d | 3090 | $0 | 7-13d, $0 |
 | M8: Scale-Up Ready | 2-3d | 3090 | $0 | 8-14d, $0 |
 | M9: v2 Tiny Train | 2-3d | 3090 | $0 | 10-17d, $0 |
 | M10: v2.1 Tiny Train | 2-3d | 3090 | $0 | 12-20d, $0 |
