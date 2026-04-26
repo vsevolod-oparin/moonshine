@@ -1,0 +1,66 @@
+model:
+  version: v2
+  vocab_size: 256
+  enc_dim: 320
+  dec_dim: 320
+  enc_num_layers: 6
+  dec_num_layers: 6
+  enc_num_heads: 8
+  dec_num_heads: 8
+  enc_ffn_dim: 1280
+  dec_ffn_dim: 1280
+  max_position_embeddings: 2048
+  rope_theta: 10000.0
+  partial_rotary_factor: 0.9
+  attention_dropout: 0.1
+  ffn_dropout: 0.1
+  window_left: 16
+  window_right_first_last: 4
+  window_right_middle: 0
+  ctc_weight: 0.3
+  label_smoothing: 0.1
+  blank_token_id: 3
+  sos_eos_token_id: 4
+  pad_token_id: 5
+  qk_norm: false
+  min_audio_samples: 400
+
+training:
+  optimizer:
+    name: schedulefree
+    lr: 0.001
+    weight_decay: 0.01
+  batch_size: 16
+  accum_steps: 4
+  max_steps: 50000
+  grad_clip: 5.0
+  warmup_steps: 2000
+
+  augmentation:
+    spec_augment: true
+    time_mask_width: 0.05
+    freq_mask_width: 15
+    n_time_masks: 2
+    n_freq_masks: 2
+    speed_perturbation: true
+    speed_factors: [0.9, 1.0, 1.1]
+    warmup_steps: 5000
+
+  validation:
+    every_n_steps: 2000
+    max_batches: 50
+
+  checkpointing:
+    every_n_steps: 2000
+    save_top_k: 5
+
+logging:
+  backend: wandb
+  project: ru-moonshine
+  name: v2-tiny-phase1
+
+data:
+  train_manifest: data/manifests/train.jsonl
+  val_manifest: data/manifests/val.jsonl
+  tokenizer_model: data/tokenizer_256.model
+  mixing_temperature: 5.0

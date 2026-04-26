@@ -181,11 +181,13 @@ class ASRDataset(Dataset):
         min_duration: float = 1.0,
         spec_augment: bool = False,
         speed_perturbation: bool = False,
+        raw_audio: bool = False,
     ):
         self.records = load_manifest(manifest_path)
         self.processor = audio_processor or AudioProcessor()
         self.max_duration = max_duration
         self.min_duration = min_duration
+        self.raw_audio = raw_audio
 
         self.records = [
             r for r in self.records
@@ -212,37 +214,52 @@ class ASRDataset(Dataset):
         if self.speed_perturb:
             audio = self.speed_perturb(audio)
 
+        text = record["text"]
+
+        if self.tokenizer:
+            token_ids = self.tokenizer.encode(text, out_type=int)
+            token_ids = [t for t in token_ids if t >= 6]
+            tokens = torch.tensor(token_ids, dtype=torch.long)
+        else:
+            tokens = text
+
+        if self.raw_audio:
+            return torch.from_numpy(audio).float(), tokens
+
         mel = self.processor.audio_to_mel(torch.from_numpy(audio))
 
         if self.spec_augment:
             mel = self.spec_augment(mel)
 
-        text = record["text"]
-
-        if self.tokenizer:
-            token_ids = self.tokenizer.encode(text, out_type=int)
-            token_ids = [t for t in token_ids if t not in (0, 1, 2)]
-            return mel, torch.tensor(token_ids, dtype=torch.long)
-
-        return mel, text
+        return mel, tokens
 
 
 def collate_fn(batch, tokenizer=None):
-    mels, texts = zip(*batch)
+    inputs, texts = zip(*batch)
 
-    mel_lengths = [m.shape[-1] for m in mels]
-    max_mel_len = max(mel_lengths)
+    is_raw_audio = inputs[0].dim() == 1
 
-    mels_padded = []
-    for mel in mels:
-        if mel.dim() == 2:
-            pad_size = max_mel_len - mel.shape[-1]
-            mels_padded.append(F.pad(mel, (0, pad_size)))
-        else:
-            mels_padded.append(mel)
-
-    mels_batch = torch.stack(mels_padded)
-    mel_lengths = torch.tensor(mel_lengths, dtype=torch.long)
+    if is_raw_audio:
+        audio_lengths = [a.shape[0] for a in inputs]
+        max_audio_len = max(audio_lengths)
+        audio_padded = []
+        for a in inputs:
+            pad_size = max_audio_len - a.shape[0]
+            audio_padded.append(F.pad(a, (0, pad_size)))
+        audio_batch = torch.stack(audio_padded)
+        audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
+    else:
+        mel_lengths = [m.shape[-1] for m in inputs]
+        max_mel_len = max(mel_lengths)
+        mels_padded = []
+        for mel in inputs:
+            if mel.dim() == 2:
+                pad_size = max_mel_len - mel.shape[-1]
+                mels_padded.append(F.pad(mel, (0, pad_size)))
+            else:
+                mels_padded.append(mel)
+        audio_batch = torch.stack(mels_padded)
+        audio_lengths = torch.tensor(mel_lengths, dtype=torch.long)
 
     if isinstance(texts[0], torch.Tensor):
         max_text_len = max(t.shape[0] for t in texts)
@@ -250,13 +267,13 @@ def collate_fn(batch, tokenizer=None):
         text_lengths = []
         for t in texts:
             pad_size = max_text_len - t.shape[0]
-            texts_padded.append(F.pad(t, (0, pad_size), value=0))
+            texts_padded.append(F.pad(t, (0, pad_size), value=-100))
             text_lengths.append(t.shape[0])
         texts_batch = torch.stack(texts_padded)
         text_lengths = torch.tensor(text_lengths, dtype=torch.long)
-        return mels_batch, mel_lengths, texts_batch, text_lengths
+        return audio_batch, audio_lengths, texts_batch, text_lengths
 
-    return mels_batch, mel_lengths, texts
+    return audio_batch, audio_lengths, texts
 
 
 def create_dataloader(
@@ -267,12 +284,14 @@ def create_dataloader(
     tokenizer_model: Optional[str] = None,
     spec_augment: bool = False,
     speed_perturbation: bool = False,
+    raw_audio: bool = False,
 ):
     dataset = ASRDataset(
         manifest_path=manifest_path,
         tokenizer_model=tokenizer_model,
         spec_augment=spec_augment,
         speed_perturbation=speed_perturbation,
+        raw_audio=raw_audio,
     )
     loader = DataLoader(
         dataset,

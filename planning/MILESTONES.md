@@ -198,22 +198,27 @@ Corpus: 103K unique sentences (CV21 ru: 122K, RuLS: 57K, deduplicated).
      - Abbreviation expansion using dictionary from M2
      - Remove non-speech markers
      - Keep hyphenated words as single tokens
-4. Deduplicate across datasets (exact text match + audio duration match)
-5. Split: 95% train / 5% validation per dataset, by speaker ID (for CV, RuLS)
-6. Create manifests (JSON lines): `data/manifests/train.jsonl`, `val.jsonl`, `test.jsonl`
-   - Each line: `{"audio_path": "...", "text": "...", "duration": 5.2, "dataset": "cv21", "speaker_id": "..."}`
-7. Download MUSAN corpus (noise + music + babble) and generate synthetic RIRs using Kaldi's RIR generator. Save to `data/augmentation/`
- 8. Build PyTorch `Dataset` class that reads manifests, loads audio on-the-fly, applies augmentation (SpecAugment, speed perturbation, MUSAN noise, RIR — configurable via YAML)
-    - **Vectorized SpecAugment**: generate all masks in parallel on GPU via batched random tensors, not per-sample Python loops. 10-50x faster. Source: NeMo
-    - **Adaptive time masking**: `time_width` as float (e.g., 0.05 = 5% of seq length) instead of fixed frame count. Scales masks to utterance length. Source: NeMo, ESPnet
-    - **Augmentation warmup**: skip all augmentation for first N optimizer steps (configurable, default 5000). Only apply when `global_step >= warmup_steps`. Critical for small data regime. Source: SpeechBrain
-    - **Balanced augmentation**: when running multiple augmentations in parallel, fix total batch size so augmented data doesn't overwhelm original (`parallel_augment_fixed_bs`). Source: SpeechBrain
+ 4. Deduplicate across datasets (exact text match + audio duration match)
+ 5. Split: 95% train / 5% validation per dataset, by speaker ID (for CV, RuLS)
+ 6. Create manifests (JSON lines): `data/manifests/train.jsonl`, `val.jsonl`, `test.jsonl`
+    - Each line: `{"audio_path": "...", "text": "...", "duration": 5.2, "dataset": "cv21", "speaker_id": "..."}`
+    - **Punctuation normalization**: normalize repeated punctuation in manifests (`!..`→`!`, `?..`→`?`, `....`→`...`, `!!!`→`!`, `?!`→`?`, `..`→`.`, `?.`→`?`, `!.`→`!`). Preserve legitimate `...` (ellipsis for pauses/interruptions). This is safe text preprocessing, not content removal.
+ 7. Download MUSAN corpus (noise + music + babble) and generate synthetic RIRs using Kaldi's RIR generator. Save to `data/augmentation/`
+    - **Note**: MUSAN requires license agreement. If unavailable, defer to Phase 2 — Phase 1 Tiny on 248h can proceed with SpecAugment + speed perturbation only
+  8. Build PyTorch `Dataset` class that reads manifests, loads audio on-the-fly, applies augmentation (SpecAugment, speed perturbation, MUSAN noise, RIR — configurable via YAML)
+     - **Vectorized SpecAugment**: generate all masks in parallel on GPU via batched random tensors, not per-sample Python loops. 10-50x faster. Source: NeMo
+     - **Adaptive time masking**: `time_width` as float (e.g., 0.05 = 5% of seq length) instead of fixed frame count. Scales masks to utterance length. Source: NeMo, ESPnet
+     - **Augmentation warmup**: skip all augmentation for first N optimizer steps (configurable, default 5000). Only apply when `global_step >= warmup_steps`. Critical for small data regime. Source: SpeechBrain
+     - **Balanced augmentation**: when running multiple augmentations in parallel, fix total batch size so augmented data doesn't overwhelm original (`parallel_augment_fixed_bs`). Source: SpeechBrain
+     - **Data mixing strategy**: for Phase 1 (2 datasets: CV21 + RuLS), use temperature-based sampling with temperature=5 to flatten sampling toward equal representation. Source: NeMo. For Phase 2+ (>3 datasets), consider power-law category sampler with β=0.7. Source: ESPnet
+     - **Stochastic subword sampling**: during training, call `sp.encode(text, nbest_size=5, alpha=0.1)` to sample different valid BPE segmentations per epoch. Robustness to tokenization boundary ambiguity for Russian morphology. At inference, use deterministic `nbest_size=1`. Source: ESPnet
+     - **Dithering**: add 1e-5 × white noise to audio during feature extraction (training only). Prevents edge cases in mel filterbank computation. Source: NeMo
  9. Verify data loader: iterate 100 batches, check shapes, no crashes, no NaN
 
 ### Self-Check
 
 - [ ] `data/versions.json` exists with all datasets pinned
-- [ ] `data/manifests/train.jsonl` has ~5.4K hours of entries
+- [ ] `data/manifests/train.jsonl` has entries for all downloaded datasets (Phase 1: ~248h from CV21 + RuLS; Phase 2: ~5.4Kh when Golos/SOVA/ToneWebinars added)
 - [ ] No NaN/Inf in audio features from data loader
 - [ ] Batch shapes correct: `(B, T)`, `(B, L)` for audio and text
 - [ ] Augmentation runs without error on 100 batches
@@ -226,8 +231,8 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 ### Deliverables
 
 - `data/versions.json`
-- `data/manifests/{train,val,test}.jsonl`
-- `data/augmentation/` (MUSAN + RIRs)
+- `data/manifests/{train,val}.jsonl` (train: 156K clips / 237h, val: 7.2K clips / 11.2h from CV21 + RuLS)
+- `data/augmentation/` (MUSAN + RIRs — deferred if license unavailable)
 - `training/dataset.py` (PyTorch Dataset + DataLoader)
 - Preprocessing scripts in `scripts/`
 
@@ -289,21 +294,32 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 ### Self-Check
 
-- [ ] T1: logits shape correct, no NaN — for both v2 and v2.1 Tiny
-- [ ] T2: all grads exist, finite norms — for both v2 and v2.1 Tiny
-- [ ] T3: attention masks correct for (16,0) and (16,4)
-- [ ] T4: output shape (250, enc_dim), no NaN/Inf
+- [x] T1: logits shape correct, no NaN — for both v2 and v2.1 Tiny (8/8 tests pass)
+- [x] T2: all grads exist, finite norms — for both v2 and v2.1 Tiny
+- [x] T3: attention masks correct for (16,0) and (16,4)
+- [x] T4: output shape (207, enc_dim), no NaN/Inf (Conv1d preprocessor gives ~41Hz, not 50Hz)
 
 ### Gate
 
-**T1 and T2 pass for both v2 and v2.1 Tiny.** If T1/T2 fail = architecture bug. Fix before proceeding.
+**T1 and T2 pass for both v2 and v2.1 Tiny.** Gate passed. Code review completed — 14 issues fixed (see `reports/milestone-4-review.md`), 10 deferred to later milestones.
 
 ### Deliverables
 
-- `models/` — full model code for v2 and v2.1
-- `inference/streaming_encoder.py` — cache-aware incremental encoder
-- `configs/v2_tiny.yaml`, `configs/v21_tiny.yaml` — model configs
-- T1-T4 test results
+- `models/config.py` — ModelConfig, presets, YAML loader
+- `models/rope.py` — RotaryEmbedding, StreamingRotaryEmbedding
+- `models/attention.py` — MultiHeadAttention with SDPA, GQA, QK norm, KV cache
+- `models/masks.py` — vectorized sliding-window, causal, padding, cross-window masks
+- `models/preprocessor.py` — Conv1d subsampling with short-audio padding
+- `models/encoder.py` — EncoderV2 with deduplicated masks
+- `models/encoder_v21.py` — EncoderV21 (causal downsample, depthwise conv, U-Net, SSC, stochastic depth with scaling)
+- `models/decoder.py` — Decoder (causal, RoPE, cross-attention, SwiGLU)
+- `models/adapter.py` — positional embedding + linear projection
+- `models/model.py` — RuMoonshine (full model, forward contract, CTC, weight init)
+- `inference/streaming_encoder.py` — StreamingASR with KV cache + hallucination detection
+- `configs/v2_tiny.yaml`, `configs/v21_tiny.yaml`
+- `tests/test_m4_model.py` — T1-T4 tests (8/8 pass)
+- `training/dataset.py` — updated: `raw_audio=True` mode, token padding with -100
+- `reports/milestone-4-review.md` — code review with 29 findings, 14 fixed, 10 deferred
 
 ---
 
