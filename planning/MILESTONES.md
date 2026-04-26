@@ -407,29 +407,32 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 ### Self-Check
 
-- [ ] Training loop runs for 100 steps on random data without error
-- [ ] Non-finite gradient handling: inject NaN loss, verify step is skipped, training continues
-- [ ] Logger shows metrics (W&B dashboard at wandb.ai, or `tensorboard --logdir runs/`)
-- [ ] Switching `logging.backend: tensorboard` works without code changes
-- [ ] Checkpoint saves and loads correctly
-- [ ] Gradient accumulation produces correct effective batch size
-- [ ] Bucket-shuffle sampler groups similar-length samples together
-- [ ] Preemption: SIGTERM during training → checkpoint saved → resume succeeds
-- [ ] T7: CTC loss finite, positive, decreasing
-- [ ] T8: Both AED and CTC losses decrease, no NaN
+- [x] Training loop runs for 100 steps on random data without error
+- [x] Non-finite gradient handling: inject NaN loss, verify step is skipped, training continues
+- [x] Logger shows metrics (W&B dashboard at wandb.ai, or `tensorboard --logdir runs/`)
+- [x] Switching `logging.backend: tensorboard` works without code changes
+- [x] Checkpoint saves and loads correctly
+- [x] Gradient accumulation produces correct effective batch size
+- [x] Bucket-shuffle sampler groups similar-length samples together
+- [x] Preemption: SIGTERM during training → checkpoint saved → resume succeeds
+- [x] T7: CTC loss finite, positive, decreasing
+- [x] T8: Both AED and CTC losses decrease, no NaN
 
 ### Gate
 
-**T7 and T8 pass.** Joint loss converges. If T7 fails = CTC bug. If T8 fails = loss weighting issue.
+**T7 and T8 pass.** Gate passed. CTC loss: 33.3 → 5.9 in 50 steps. Joint loss: 15.1 → 3.0 in 500 steps with Schedule-Free. Fixed preprocessor CUDA device bug (`out_lengths` created on CPU). Code review completed — 10 issues found and fixed (see `reports/milestone-5-review.md`).
 
 ### Deliverables
 
-- `training/train.py` — full training loop
-- `training/validate.py` — WER evaluation
-- `training/checkpoint.py` — save/load/resume/average
+- `training/train.py` — full training loop with Schedule-Free/AdamW, AMP, grad accumulation, non-finite handling, dynamic window, preemption
+- `training/validate.py` — WER/CER/SER evaluation with ErrorRateStats
+- `training/checkpoint.py` — save/load/resume/average + top-K management + SIGTERM handler
 - `training/logger.py` — dual-backend logger (wandb / tensorboard, config-selected)
 - `training/sampler.py` — bucket-shuffle batch sampler
-- `configs/train_v2_tiny.yaml` — example training config
+- `configs/v2_tiny.yaml` — updated training config (already existed)
+- Bug fix: `models/preprocessor.py` — `out_lengths` now created on correct device
+- Bug fix: `training/dataset.py` — SentencePiece lazy loading for DataLoader workers
+- `reports/milestone-5-review.md` — code review with 12 findings, 10 fixed
 
 ---
 

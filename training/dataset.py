@@ -197,16 +197,21 @@ class ASRDataset(Dataset):
         self.spec_augment = SpecAugment() if spec_augment else None
         self.speed_perturb = SpeedPerturbation() if speed_perturbation else None
 
+        self._tokenizer_path = tokenizer_model
         self.tokenizer = None
-        if tokenizer_model:
-            import sentencepiece as spm
-            self.tokenizer = spm.SentencePieceProcessor()
-            self.tokenizer.Load(tokenizer_model)
 
     def __len__(self):
         return len(self.records)
 
+    def _ensure_tokenizer(self):
+        if self.tokenizer is None and self._tokenizer_path:
+            import sentencepiece as spm
+
+            self.tokenizer = spm.SentencePieceProcessor()
+            self.tokenizer.Load(self._tokenizer_path)
+
     def __getitem__(self, idx):
+        self._ensure_tokenizer()
         record = self.records[idx]
 
         audio = self.processor.load_audio(record["audio_path"])
@@ -234,7 +239,7 @@ class ASRDataset(Dataset):
         return mel, tokens
 
 
-def collate_fn(batch, tokenizer=None):
+def collate_fn(batch):
     inputs, texts = zip(*batch)
 
     is_raw_audio = inputs[0].dim() == 1
@@ -298,7 +303,7 @@ def create_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=lambda b: collate_fn(b, tokenizer=tokenizer_model),
+        collate_fn=collate_fn,
         pin_memory=True,
         drop_last=False,
     )

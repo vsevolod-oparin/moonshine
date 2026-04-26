@@ -30,10 +30,13 @@ class Preprocessor(nn.Module):
         self, audio: torch.Tensor, audio_lengths: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         min_len = self.MIN_INPUT_SAMPLES
-        if audio.size(-1) < min_len:
-            audio = F.pad(audio, (0, min_len - audio.size(-1)))
+        needs_pad = audio.size(-1) < min_len
+        if needs_pad:
+            pad_size = min_len - audio.size(-1)
+            audio = F.pad(audio, (0, pad_size))
             if audio_lengths is not None:
-                audio_lengths = torch.clamp(audio_lengths, max=0)
+                short_mask = audio_lengths < min_len
+                audio_lengths = torch.where(short_mask, torch.zeros_like(audio_lengths), audio_lengths)
 
         with torch.amp.autocast("cuda", enabled=False):
             x = audio.float().unsqueeze(1)
@@ -45,8 +48,9 @@ class Preprocessor(nn.Module):
 
         out_lengths = None
         if audio_lengths is not None:
-            out_lengths = torch.stack(
-                [torch.tensor(self.output_length(l.item())) for l in audio_lengths]
+            out_lengths = torch.tensor(
+                [self.output_length(l.item()) for l in audio_lengths],
+                dtype=torch.long, device=audio.device,
             )
             if x.size(1) < out_lengths.max().item():
                 out_lengths = torch.clamp(out_lengths, max=x.size(1))

@@ -34,6 +34,7 @@ training:
   accum_steps: 4
   max_steps: 50000
   grad_clip: 5.0
+  # warmup_steps only applies to AdamW fallback; Schedule-Free handles warmup internally
   warmup_steps: 2000
 
   augmentation:
