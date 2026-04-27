@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from models.attention import MultiHeadAttention
 from models.config import ModelConfig
-from models.masks import make_causal_mask, make_padding_mask, combine_masks
+from models.masks import _MASK_NEG, make_causal_mask, make_padding_mask, combine_masks
 from models.rope import RotaryEmbedding
 
 
@@ -122,14 +122,14 @@ class Decoder(nn.Module):
         self_attn_mask = make_causal_mask(seq_len, x.device, x.dtype)
         if dec_lengths is not None:
             pad_mask = make_padding_mask(dec_lengths, seq_len).unsqueeze(1).unsqueeze(2)
-            pad_mask = (~pad_mask).float().masked_fill(~pad_mask, float("-inf"))
+            pad_mask = (~pad_mask).float().masked_fill(~pad_mask, _MASK_NEG)
             self_attn_mask = combine_masks(self_attn_mask, pad_mask)
 
         enc_seq_len = enc_output.size(1)
         cross_attn_mask = None
         if enc_lengths is not None:
             enc_pad = make_padding_mask(enc_lengths, enc_seq_len).unsqueeze(1).unsqueeze(2)
-            cross_attn_mask = (~enc_pad).float().masked_fill(~enc_pad, float("-inf"))
+            cross_attn_mask = (~enc_pad).float().masked_fill(~enc_pad, _MASK_NEG)
 
         for layer in self.layers:
             x = layer(

@@ -62,7 +62,8 @@ class RuMoonshine(nn.Module):
         self, audio: torch.Tensor, audio_lengths: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x, out_lengths = self.preprocessor(audio, audio_lengths)
-        enc_output = self.encoder(x, out_lengths)
+        with torch.amp.autocast("cuda", enabled=False):
+            enc_output = self.encoder(x, out_lengths)
         return enc_output, out_lengths
 
     def decode(

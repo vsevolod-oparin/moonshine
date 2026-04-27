@@ -1,5 +1,7 @@
 import torch
 
+_MASK_NEG = -1e4
+
 
 def make_sliding_window_mask(
     seq_len: int,
@@ -13,7 +15,7 @@ def make_sliding_window_mask(
     mask = torch.where(
         (cols >= rows - window_left) & (cols <= rows + window_right),
         torch.tensor(0.0, device=device, dtype=dtype),
-        torch.tensor(float("-inf"), device=device, dtype=dtype),
+        torch.tensor(_MASK_NEG, device=device, dtype=dtype),
     )
     return mask.unsqueeze(0).unsqueeze(0)
 
@@ -23,7 +25,7 @@ def make_causal_mask(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype), diagonal=1)
+    mask = torch.triu(torch.full((seq_len, seq_len), _MASK_NEG, device=device, dtype=dtype), diagonal=1)
     return mask.unsqueeze(0).unsqueeze(0)
 
 

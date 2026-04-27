@@ -8,6 +8,7 @@ from models.attention import MultiHeadAttention
 from models.config import ModelConfig
 from models.encoder import EncoderFFN
 from models.masks import (
+    _MASK_NEG,
     make_cross_window_mask,
     make_sliding_window_mask,
     combine_masks,
@@ -172,7 +173,7 @@ class EncoderV21(nn.Module):
             )
         if lengths is not None:
             pad_mask = make_padding_mask(lengths, seq_len).unsqueeze(1).unsqueeze(2)
-            pad_mask = (~pad_mask).float().masked_fill(~pad_mask, float("-inf"))
+            pad_mask = (~pad_mask).float().masked_fill(~pad_mask, _MASK_NEG)
             mask = combine_masks(mask, pad_mask)
         return mask
 

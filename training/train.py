@@ -2,6 +2,7 @@ import argparse
 import logging
 import math
 import random
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,56 @@ from training.sampler import BucketShuffleSampler
 from training.validate import validate
 
 logger = logging.getLogger(__name__)
+
+_GPU_TEMP_WARN = 85
+_GPU_TEMP_CRIT = 90
+_last_gpu_log = 0.0
+
+
+def _gpu_stats():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=temperature.gpu,power.draw,utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+        parts = out.strip().split(", ")
+        return {
+            "temp": float(parts[0]),
+            "power": float(parts[1]),
+            "util": float(parts[2]),
+            "mem_mib": float(parts[3]),
+        }
+    except Exception:
+        return None
+
+
+def _log_gpu_temp(step, force=False):
+    global _last_gpu_log
+    import time
+    now = time.time()
+    if not force and (now - _last_gpu_log) < 60:
+        return
+    gs = _gpu_stats()
+    if gs is None:
+        return
+    _last_gpu_log = now
+    temp = gs["temp"]
+    if temp >= _GPU_TEMP_CRIT:
+        logger.warning(
+            f"[step {step}] GPU CRITICAL: {temp:.0f}C, {gs['power']:.0f}W, "
+            f"{gs['mem_mib']:.0f}MB"
+        )
+    elif temp >= _GPU_TEMP_WARN:
+        logger.warning(
+            f"[step {step}] GPU HOT: {temp:.0f}C, {gs['power']:.0f}W"
+        )
+    return gs
 
 
 def setup_optimizer(model, cfg: dict) -> torch.optim.Optimizer:
@@ -294,6 +345,8 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+                _log_gpu_temp(global_step)
+
                 epoch_loss += stats["loss"]
                 epoch_batches += 1
 
@@ -308,6 +361,10 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         "train/step": global_step,
                         "train/epoch": epoch,
                     }
+                    gs = _log_gpu_temp(global_step, force=True)
+                    if gs:
+                        log_metrics["sys/gpu_temp"] = gs["temp"]
+                        log_metrics["sys/gpu_power"] = gs["power"]
                     train_logger.log(log_metrics, global_step)
                     logger.info(
                         f"[step {global_step}] loss={stats['loss']:.4f} "

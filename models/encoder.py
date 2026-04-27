@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from models.attention import MultiHeadAttention
 from models.config import ModelConfig
-from models.masks import make_sliding_window_mask, combine_masks, make_padding_mask
+from models.masks import _MASK_NEG, make_sliding_window_mask, combine_masks, make_padding_mask
 from models.rope import RotaryEmbedding
 
 
@@ -89,7 +89,7 @@ class EncoderV2(nn.Module):
                 )
                 if lengths is not None:
                     pad_mask = make_padding_mask(lengths, seq_len).unsqueeze(1).unsqueeze(2)
-                    pad_mask = (~pad_mask).float().masked_fill(~pad_mask, float("-inf"))
+                    pad_mask = (~pad_mask).float().masked_fill(~pad_mask, _MASK_NEG)
                     sw = combine_masks(sw, pad_mask)
                 seen[key] = sw
             masks[idx] = seen[key]

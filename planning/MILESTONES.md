@@ -461,19 +461,23 @@ Data loader produces correct shapes for 100 consecutive batches. Train manifest 
 
 ### Self-Check
 
-- [ ] T5: WER = 0 on 10 overfit clips (v2 and v2.1)
-- [ ] T6: WER < 5% on 100 overfit clips (v2 and v2.1)
-- [ ] T17: Memory profiled, batch sizes confirmed
+- [x] T5: WER = 0 on 10 overfit clips (v2 and v2.1)
+- [x] T6: WER < 5% on 100 overfit clips (v2 and v2.1) — achieved WER=0%
+- [x] T17: Memory profiled, batch sizes confirmed
 
 ### Gate
 
-**T5 passes = model can learn.** If T5 fails, do not proceed — fundamental issue. T6 passes = tokenizer works.
+**T5 passes = model can learn.** T6 passes = tokenizer works. T17 confirms memory sufficient. All gates passed. Fixed SDPA NaN under AMP (masks use -1e4 instead of -inf). Encoder forced to FP32 under AMP. See `reports/milestone-6-overfit-check.md`.
 
 ### Deliverables
 
-- Overfit checkpoints (v2 + v2.1 Tiny)
-- GPU memory profile results
-- T5, T6, T17 test reports
+- `scripts/overfit_check.py` — overfit test script with GPU temperature monitoring
+- `configs/overfit_v{2,v21}_tiny_{10,100}.yaml` — overfit configs
+- `data/manifests/overfit_{10,100}.jsonl` — subset manifests
+- Bug fixes: SDPA NaN masks, v2.1 encoder NaN backward, training divergence
+- GPU memory profile: v2 Tiny 1967MB, v2.1 Tiny 2164MB (batch=32)
+- Temperature monitoring in `training/train.py`
+- `reports/milestone-6-overfit-check.md`
 
 ---
 
