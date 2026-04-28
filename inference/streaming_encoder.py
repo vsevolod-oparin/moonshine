@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from models.config import ModelConfig
+from models.decoder import DecoderCache
 from models.encoder import EncoderV2
 from models.masks import _MASK_NEG
 from models.rope import StreamingRotaryEmbedding
@@ -81,6 +82,10 @@ class StreamingEncoderV2:
 
     @torch.no_grad()
     def process_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
+        was_training = self.encoder.training
+        if was_training:
+            self.encoder.eval()
+
         chunk_len = chunk.size(1)
         frame_offset = self.cache.frame_count
         rope_cos, rope_sin = self.rope(chunk_len, offset=frame_offset)
@@ -125,7 +130,10 @@ class StreamingEncoderV2:
             x_norm = layer.ffn_norm(chunk)
             chunk = residual + layer.ffn(x_norm)
 
-        return self.encoder.norm(chunk)
+        result = self.encoder.norm(chunk)
+        if was_training:
+            self.encoder.train()
+        return result
 
     def reset(self):
         self.cache.reset()
@@ -194,48 +202,50 @@ class StreamingASR:
         self.repetition_detector = RepetitionDetector(max_repeat=4)
         self.hallucination_detector = HallucinationDetector()
 
-        self.frame_buffer: list[torch.Tensor] = []
+        self._pending_frames: torch.Tensor | None = None
         self.encoder_buffer: list[torch.Tensor] = []
-        self.prev_text: str = ""
-        self.hold_buffer: list[int] = []
-        self.hold_n = 0
+        self.prev_text: str = ""  # Planned: segment deduplication across chunks
+        self.hold_buffer: list[int] = []  # Planned: hold-N mechanism for token revision
+        self.hold_n = 0  # Planned: number of tokens to hold back between chunks
 
     @torch.no_grad()
     def add_audio_chunk(self, audio_chunk: torch.Tensor):
         with torch.amp.autocast("cuda", enabled=False):
             frames, _ = self.model.preprocessor(audio_chunk.unsqueeze(0), None)
-        for t in range(frames.size(1)):
-            self.frame_buffer.append(frames[:, t : t + 1, :])
 
-        while len(self.frame_buffer) >= self.chunk_size:
-            chunk_frames = torch.cat(self.frame_buffer[: self.chunk_size], dim=1)
-            self.frame_buffer = self.frame_buffer[self.chunk_size :]
+        if self._pending_frames is None:
+            self._pending_frames = frames
+        else:
+            self._pending_frames = torch.cat([self._pending_frames, frames], dim=1)
+
+        while self._pending_frames.size(1) >= self.chunk_size:
+            chunk_frames = self._pending_frames[:, : self.chunk_size, :]
+            self._pending_frames = self._pending_frames[:, self.chunk_size :]
             enc_out = self.streaming_encoder.process_chunk(chunk_frames)
-            for t in range(enc_out.size(1)):
-                self.encoder_buffer.append(enc_out[:, t, :].squeeze(0))
+            self.encoder_buffer.append(enc_out.squeeze(0))
 
     @torch.no_grad()
     def flush_remaining(self):
-        if not self.frame_buffer:
+        if self._pending_frames is None or self._pending_frames.size(1) == 0:
             return
-        chunk_frames = torch.cat(self.frame_buffer, dim=1)
-        self.frame_buffer = []
-        enc_out = self.streaming_encoder.process_chunk(chunk_frames)
-        for t in range(enc_out.size(1)):
-            self.encoder_buffer.append(enc_out[:, t, :].squeeze(0))
+        enc_out = self.streaming_encoder.process_chunk(self._pending_frames)
+        self._pending_frames = None
+        self.encoder_buffer.append(enc_out.squeeze(0))
 
     @torch.no_grad()
     def decode_buffer(self, max_tokens: int = 100) -> list[int]:
         if not self.encoder_buffer:
             return []
 
-        enc_output = torch.stack(self.encoder_buffer, dim=1)
+        enc_output = torch.cat(self.encoder_buffer, dim=0).unsqueeze(0)
         enc_output = self.model.adapter(enc_output)
+
+        cache = DecoderCache(len(self.model.decoder.layers))
 
         sos = torch.tensor(
             [[self.config.sos_eos_token_id]], device=enc_output.device
         )
-        dec_output = self.model.decoder(sos, enc_output)
+        dec_output, cache = self.model.decoder(sos, enc_output, cache=cache)
         logits = self.model.lm_head(dec_output)
 
         token = logits[:, -1, :].argmax(dim=-1).item()
@@ -243,12 +253,9 @@ class StreamingASR:
             return []
 
         tokens = [token]
-        generated = sos.clone()
         for _ in range(max_tokens - 1):
-            generated = torch.cat(
-                [generated, torch.tensor([[token]], device=enc_output.device)], dim=1
-            )
-            dec_output = self.model.decoder(generated, enc_output)
+            new_token = torch.tensor([[token]], device=enc_output.device)
+            dec_output, cache = self.model.decoder(new_token, enc_output, cache=cache)
             logits = self.model.lm_head(dec_output)
             token = logits[:, -1, :].argmax(dim=-1).item()
 
@@ -265,7 +272,7 @@ class StreamingASR:
 
     def reset(self):
         self.streaming_encoder.reset()
-        self.frame_buffer = []
+        self._pending_frames = None
         self.encoder_buffer = []
         self.prev_text = ""
         self.hold_buffer = []

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from models.config import PRESETS
 from models.model import RuMoonshine
-from inference.streaming_encoder import StreamingEncoderV2, CircularKVCache
+from inference.streaming_encoder import StreamingEncoderV2
 
 
 def _encode_non_streaming(model: RuMoonshine, audio: torch.Tensor) -> torch.Tensor:
@@ -276,13 +276,6 @@ class TestT14ONNXExport:
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
-
-    def _get_onnx_eps(self):
-        try:
-            import onnxruntime
-            return onnxruntime.get_available_providers()
-        except ImportError:
-            pytest.skip("onnxruntime not available")
 
     def test_encoder_export(self, v2_tiny, tmp_path):
         import onnxruntime as ort

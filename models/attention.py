@@ -71,20 +71,24 @@ class MultiHeadAttention(nn.Module):
         is_cross_attn = key_value_states is not None
         q = self.q_proj(x).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        kv_input = key_value_states if is_cross_attn else x
-        k = self.k_proj(kv_input).view(bsz, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(kv_input).view(bsz, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if is_cross_attn and past_key is not None:
+            k = past_key
+            v = past_value
+        else:
+            kv_input = key_value_states if is_cross_attn else x
+            k = self.k_proj(kv_input).view(bsz, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.v_proj(kv_input).view(bsz, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         if not is_cross_attn and rope_cos is not None and rope_sin is not None:
             q, k = self._apply_qk_norm(q, k)
             q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
 
-        if past_key is not None and not is_cross_attn:
+        if not is_cross_attn and past_key is not None:
             k = torch.cat([past_key, k], dim=2)
             v = torch.cat([past_value, v], dim=2)
 
-        new_key = k if use_cache and not is_cross_attn else None
-        new_value = v if use_cache and not is_cross_attn else None
+        new_key = k if use_cache else None
+        new_value = v if use_cache else None
 
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
