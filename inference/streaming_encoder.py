@@ -1,27 +1,43 @@
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
-from models.attention import MultiHeadAttention
 from models.config import ModelConfig
-from models.encoder import EncoderLayer, EncoderV2
-from models.encoder_v21 import EncoderLayerV21, EncoderV21
-from models.preprocessor import Preprocessor
+from models.encoder import EncoderV2
+from models.masks import _MASK_NEG
 from models.rope import StreamingRotaryEmbedding
 
 
+def _make_streaming_chunk_mask(
+    kv_len: int,
+    chunk_len: int,
+    window_left: int,
+    window_right: int,
+    kv_start: int,
+    device: torch.device,
+) -> torch.Tensor:
+    abs_positions = torch.arange(kv_start, kv_start + kv_len, device=device, dtype=torch.long)
+    query_positions = abs_positions[-chunk_len:]
+    rows = query_positions.unsqueeze(1)
+    cols = abs_positions.unsqueeze(0)
+    mask = torch.where(
+        (cols >= rows - window_left) & (cols <= rows + window_right),
+        torch.tensor(0.0, device=device, dtype=torch.float32),
+        torch.tensor(_MASK_NEG, device=device, dtype=torch.float32),
+    )
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
 class CircularKVCache:
-    def __init__(self, num_layers: int, num_heads: int, head_dim: int, window_size: int):
+    def __init__(self, num_layers: int, window_size: int):
         self.num_layers = num_layers
         self.window_size = window_size
         self.keys: list[torch.Tensor | None] = [None] * num_layers
         self.values: list[torch.Tensor | None] = [None] * num_layers
-        self._offset = 0
+        self._frame_count = 0
 
     @property
-    def offset(self) -> int:
-        return self._offset
+    def frame_count(self) -> int:
+        return self._frame_count
 
     def update(self, layer_idx: int, new_key: torch.Tensor, new_value: torch.Tensor):
         if self.keys[layer_idx] is None:
@@ -34,9 +50,10 @@ class CircularKVCache:
         if self.keys[layer_idx].size(2) > self.window_size:
             excess = self.keys[layer_idx].size(2) - self.window_size
             self.keys[layer_idx] = self.keys[layer_idx][:, :, excess:]
-            self.values[layer_idx] = self.values[layer_idx][:, excess:]
+            self.values[layer_idx] = self.values[layer_idx][:, :, excess:]
 
-        self._offset += new_key.size(2)
+        if layer_idx == 0:
+            self._frame_count += new_key.size(2)
 
     def get(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         return self.keys[layer_idx], self.values[layer_idx]
@@ -44,7 +61,7 @@ class CircularKVCache:
     def reset(self):
         self.keys = [None] * self.num_layers
         self.values = [None] * self.num_layers
-        self._offset = 0
+        self._frame_count = 0
 
 
 class StreamingEncoderV2:
@@ -56,29 +73,44 @@ class StreamingEncoderV2:
             max_seq_len=config.max_position_embeddings,
             theta=config.rope_theta,
         )
+        max_window = config.window_left + config.window_right_first_last + 1
         self.cache = CircularKVCache(
             num_layers=config.enc_num_layers,
-            num_heads=config.enc_num_heads,
-            head_dim=config.enc_head_dim,
-            window_size=config.window_left + config.window_right_first_last + 1,
+            window_size=max_window,
         )
 
     @torch.no_grad()
-    def process_frame(self, frame: torch.Tensor) -> torch.Tensor:
-        x = frame
-        offset = self.cache.offset
-        rope_cos, rope_sin = self.rope(1, offset=offset)
+    def process_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
+        chunk_len = chunk.size(1)
+        frame_offset = self.cache.frame_count
+        rope_cos, rope_sin = self.rope(chunk_len, offset=frame_offset)
 
         for idx, layer in enumerate(self.encoder.layers):
-            residual = x
-            x_norm = layer.attn_norm(x)
+            residual = chunk
+            x_norm = layer.attn_norm(chunk)
 
             past_key, past_value = self.cache.get(idx)
+            if past_key is not None:
+                kv_len = past_key.size(2) + chunk_len
+                kv_start = frame_offset - past_key.size(2)
+            else:
+                kv_len = chunk_len
+                kv_start = frame_offset
+
+            mask = _make_streaming_chunk_mask(
+                kv_len,
+                chunk_len,
+                layer.window_left,
+                layer.window_right,
+                kv_start,
+                chunk.device,
+            )
+
             x_attn, new_key, new_value = layer.self_attn(
                 x_norm,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
-                attention_mask=None,
+                attention_mask=mask,
                 past_key=past_key,
                 past_value=past_value,
                 use_cache=True,
@@ -87,13 +119,13 @@ class StreamingEncoderV2:
             if new_key is not None:
                 self.cache.update(idx, new_key, new_value)
 
-            x = residual + x_attn
+            chunk = residual + x_attn
 
-            residual = x
-            x_norm = layer.ffn_norm(x)
-            x = residual + layer.ffn(x_norm)
+            residual = chunk
+            x_norm = layer.ffn_norm(chunk)
+            chunk = residual + layer.ffn(x_norm)
 
-        return self.encoder.norm(x)
+        return self.encoder.norm(chunk)
 
     def reset(self):
         self.cache.reset()
@@ -147,9 +179,10 @@ class HallucinationDetector:
 
 
 class StreamingASR:
-    def __init__(self, model: nn.Module, config: ModelConfig):
+    def __init__(self, model: nn.Module, config: ModelConfig, chunk_size: int = 32):
         self.model = model
         self.config = config
+        self.chunk_size = chunk_size
         self.model.eval()
 
         if config.version == "v21":
@@ -161,6 +194,7 @@ class StreamingASR:
         self.repetition_detector = RepetitionDetector(max_repeat=4)
         self.hallucination_detector = HallucinationDetector()
 
+        self.frame_buffer: list[torch.Tensor] = []
         self.encoder_buffer: list[torch.Tensor] = []
         self.prev_text: str = ""
         self.hold_buffer: list[int] = []
@@ -168,10 +202,27 @@ class StreamingASR:
 
     @torch.no_grad()
     def add_audio_chunk(self, audio_chunk: torch.Tensor):
-        frame, _ = self.model.preprocessor(audio_chunk.unsqueeze(0), None)
-        for t in range(frame.size(1)):
-            enc_out = self.streaming_encoder.process_frame(frame[:, t : t + 1, :])
-            self.encoder_buffer.append(enc_out.squeeze(0).squeeze(0))
+        with torch.amp.autocast("cuda", enabled=False):
+            frames, _ = self.model.preprocessor(audio_chunk.unsqueeze(0), None)
+        for t in range(frames.size(1)):
+            self.frame_buffer.append(frames[:, t : t + 1, :])
+
+        while len(self.frame_buffer) >= self.chunk_size:
+            chunk_frames = torch.cat(self.frame_buffer[: self.chunk_size], dim=1)
+            self.frame_buffer = self.frame_buffer[self.chunk_size :]
+            enc_out = self.streaming_encoder.process_chunk(chunk_frames)
+            for t in range(enc_out.size(1)):
+                self.encoder_buffer.append(enc_out[:, t, :].squeeze(0))
+
+    @torch.no_grad()
+    def flush_remaining(self):
+        if not self.frame_buffer:
+            return
+        chunk_frames = torch.cat(self.frame_buffer, dim=1)
+        self.frame_buffer = []
+        enc_out = self.streaming_encoder.process_chunk(chunk_frames)
+        for t in range(enc_out.size(1)):
+            self.encoder_buffer.append(enc_out[:, t, :].squeeze(0))
 
     @torch.no_grad()
     def decode_buffer(self, max_tokens: int = 100) -> list[int]:
@@ -214,6 +265,7 @@ class StreamingASR:
 
     def reset(self):
         self.streaming_encoder.reset()
+        self.frame_buffer = []
         self.encoder_buffer = []
         self.prev_text = ""
         self.hold_buffer = []

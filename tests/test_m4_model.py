@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from models.config import PRESETS
+from models.masks import _MASK_NEG
 from models.model import RuMoonshine
 
 
@@ -78,9 +79,9 @@ class TestT3SlidingWindowMask:
             left_boundary = max(0, t - 16)
             assert allowed[left_boundary] == 0.0, f"Position {t} should see left boundary {left_boundary}"
             if left_boundary > 0:
-                assert allowed[left_boundary - 1] == float("-inf"), f"Position {t} should NOT see {left_boundary - 1}"
+                assert allowed[left_boundary - 1] == _MASK_NEG, f"Position {t} should NOT see {left_boundary - 1}"
             if t < 19:
-                assert allowed[t + 1] == float("-inf"), f"Position {t} should NOT see future (t+1)"
+                assert allowed[t + 1] == _MASK_NEG, f"Position {t} should NOT see future (t+1)"
 
     def test_window_16_4(self):
         from models.masks import make_sliding_window_mask
@@ -92,7 +93,7 @@ class TestT3SlidingWindowMask:
             for f in range(t + 1, right_edge):
                 assert allowed[f] == 0.0, f"Position {t} should see future {f} (within right window)"
             if right_edge < 20:
-                assert allowed[right_edge] == float("-inf"), f"Position {t} should NOT see {right_edge}"
+                assert allowed[right_edge] == _MASK_NEG, f"Position {t} should NOT see {right_edge}"
 
 
 class TestT4FeatureExtraction:
