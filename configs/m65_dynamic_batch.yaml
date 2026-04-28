@@ -1,0 +1,65 @@
+model:
+  version: v2
+  vocab_size: 256
+  enc_dim: 320
+  dec_dim: 320
+  enc_num_layers: 6
+  dec_num_layers: 6
+  enc_num_heads: 8
+  dec_num_heads: 8
+  enc_ffn_dim: 1280
+  dec_ffn_dim: 1280
+  max_position_embeddings: 2048
+  rope_theta: 10000.0
+  partial_rotary_factor: 0.9
+  attention_dropout: 0.0
+  ffn_dropout: 0.0
+  window_left: 16
+  window_right_first_last: 4
+  window_right_middle: 0
+  ctc_weight: 0.3
+  label_smoothing: 0.0
+  blank_token_id: 3
+  sos_eos_token_id: 4
+  pad_token_id: 5
+  qk_norm: false
+  min_audio_samples: 400
+
+training:
+  optimizer:
+    name: adamw
+    lr: 0.0005
+    weight_decay: 0.01
+    warmup_steps: 500
+    max_steps: 5000
+  batch_size: 1
+  accum_steps: 1
+  max_steps: 5000
+  grad_clip: 5.0
+  precision: fp16
+  dynamic_window: false
+  num_workers: 0
+  prefetch_factor: 4
+  num_buckets: 100
+  batching:
+    max_tokens: 30000
+    frames_per_sec: 41.0
+    max_batch_size: 512
+    min_batch_size: 4
+  log_every: 100
+  validation:
+    every_n_steps: 2500
+    max_batches: 50
+  checkpointing:
+    every_n_steps: 1000
+    save_top_k: 3
+
+logging:
+  backend: tensorboard
+  project: ru-moonshine
+  name: m65-dynamic-batch
+
+data:
+  train_manifest: data/manifests/train_tokenized.jsonl
+  val_manifest: data/manifests/val.jsonl
+  tokenizer_model: data/tokenizer_256.model

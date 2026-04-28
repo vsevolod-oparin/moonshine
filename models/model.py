@@ -135,9 +135,9 @@ class RuMoonshine(nn.Module):
             loss = loss_aed + self.config.ctc_weight * loss_ctc
 
             stats = {
-                "loss": loss.item(),
-                "loss_aed": loss_aed.item(),
-                "loss_ctc": loss_ctc.item(),
+                "loss": loss.detach(),
+                "loss_aed": loss_aed.detach(),
+                "loss_ctc": loss_ctc.detach(),
             }
 
             with torch.no_grad():
@@ -145,7 +145,7 @@ class RuMoonshine(nn.Module):
                 mask = tokens != -100
                 correct = (preds == tokens) & mask
                 acc = correct.sum().float() / mask.sum().float().clamp(min=1)
-                stats["acc"] = acc.item()
+                stats["acc"] = acc.detach()
 
             return loss, stats, torch.tensor(batch_size, device=audio.device)
 

@@ -1,8 +1,11 @@
 import argparse
+import faulthandler
 import logging
 import math
 import random
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +17,7 @@ from models.model import RuMoonshine
 from training.checkpoint import CheckpointManager, average_checkpoints
 from training.dataset import ASRDataset, collate_fn, load_manifest
 from training.logger import TrainLogger
-from training.sampler import BucketShuffleSampler
+from training.sampler import BucketShuffleSampler, DynamicBatchSampler
 from training.validate import validate
 
 logger = logging.getLogger(__name__)
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 _GPU_TEMP_WARN = 85
 _GPU_TEMP_CRIT = 90
 _last_gpu_log = 0.0
+_peak_vram_mib = 0.0
 
 
 def _gpu_stats():
@@ -31,7 +35,7 @@ def _gpu_stats():
         out = subprocess.check_output(
             [
                 "nvidia-smi",
-                "--query-gpu=temperature.gpu,power.draw,utilization.gpu,memory.used",
+                "--query-gpu=temperature.gpu,power.draw,utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
@@ -42,14 +46,24 @@ def _gpu_stats():
             "power": float(parts[1]),
             "util": float(parts[2]),
             "mem_mib": float(parts[3]),
+            "mem_total_mib": float(parts[4]),
         }
     except Exception:
         return None
 
 
+def _gpu_mem_pytorch():
+    if not torch.cuda.is_available():
+        return None
+    return {
+        "allocated_mb": torch.cuda.memory_allocated() / 1024**2,
+        "reserved_mb": torch.cuda.memory_reserved() / 1024**2,
+        "peak_allocated_mb": torch.cuda.max_memory_allocated() / 1024**2,
+    }
+
+
 def _log_gpu_temp(step, force=False):
-    global _last_gpu_log
-    import time
+    global _last_gpu_log, _peak_vram_mib
     now = time.time()
     if not force and (now - _last_gpu_log) < 60:
         return
@@ -57,15 +71,19 @@ def _log_gpu_temp(step, force=False):
     if gs is None:
         return
     _last_gpu_log = now
+    mem_pct = gs["mem_mib"] / gs["mem_total_mib"] * 100
+    if gs["mem_mib"] > _peak_vram_mib:
+        _peak_vram_mib = gs["mem_mib"]
     temp = gs["temp"]
     if temp >= _GPU_TEMP_CRIT:
         logger.warning(
             f"[step {step}] GPU CRITICAL: {temp:.0f}C, {gs['power']:.0f}W, "
-            f"{gs['mem_mib']:.0f}MB"
+            f"VRAM {mem_pct:.0f}% ({gs['mem_mib']:.0f}/{gs['mem_total_mib']:.0f}MB)"
         )
     elif temp >= _GPU_TEMP_WARN:
         logger.warning(
-            f"[step {step}] GPU HOT: {temp:.0f}C, {gs['power']:.0f}W"
+            f"[step {step}] GPU HOT: {temp:.0f}C, {gs['power']:.0f}W, "
+            f"VRAM {mem_pct:.0f}%"
         )
     return gs
 
@@ -82,8 +100,9 @@ def setup_optimizer(model, cfg: dict) -> torch.optim.Optimizer:
             model.parameters(), lr=lr, weight_decay=weight_decay, warmup_steps=0
         )
     elif name == "adamw":
+        fused = torch.cuda.is_available()
         return torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+            model.parameters(), lr=lr, weight_decay=weight_decay, fused=fused
         )
     else:
         raise ValueError(f"Unknown optimizer: {name}")
@@ -143,11 +162,56 @@ def restore_window(model_cfg: ModelConfig, orig: tuple):
     model_cfg.window_left, model_cfg.window_right_first_last, model_cfg.window_right_middle = orig
 
 
+class _StepTimer:
+    __slots__ = ("_events", "_t0", "_cpu_t0", "_labels", "_cur_label")
+
+    def __init__(self):
+        self._events = []
+        self._labels = []
+        self._t0 = None
+        self._cpu_t0 = None
+        self._cur_label = None
+
+    def start(self):
+        self._events.clear()
+        self._labels.clear()
+        self._cpu_t0 = time.perf_counter()
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        self._events.append(e)
+        self._cur_label = None
+
+    def mark(self, label: str):
+        self._labels.append(label)
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        self._events.append(e)
+
+    def cpu_mark(self, label: str):
+        self._labels.append(label)
+
+    def results_ms(self):
+        if len(self._events) < 2:
+            return {}
+        torch.cuda.synchronize()
+        out = {}
+        for i in range(len(self._events) - 1):
+            ms = self._events[i].elapsed_time(self._events[i + 1])
+            out[self._labels[i]] = ms
+        total_cpu = (time.perf_counter() - self._cpu_t0) * 1000
+        out["step_ms"] = total_cpu
+        return out
+
+
 def train(config_path: str, resume: bool = True, seed: int = 42):
+    global _peak_vram_mib
     setup_seed(seed)
 
     model_cfg, full_cfg = load_full_config(config_path)
     train_cfg = full_cfg.get("training", {})
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     data_cfg = full_cfg.get("data", {})
     log_cfg = full_cfg.get("logging", {})
     opt_cfg = train_cfg.get("optimizer", {})
@@ -190,31 +254,69 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     records = load_manifest(train_manifest)
     durations = [r.get("duration", 1.0) for r in records]
-    sampler = BucketShuffleSampler(
-        lengths=durations,
-        num_buckets=train_cfg.get("num_buckets", 100),
-        batch_size=batch_size,
-        shuffle=True,
-    )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=train_cfg.get("num_workers", 4),
-        collate_fn=collate_fn,
-        pin_memory=True,
-        drop_last=True,
-    )
+    batching_cfg = train_cfg.get("batching", {})
+    max_tokens = batching_cfg.get("max_tokens", None)
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
+    if max_tokens is not None:
+        sampler = DynamicBatchSampler(
+            lengths=durations,
+            max_tokens=max_tokens,
+            frames_per_sec=batching_cfg.get("frames_per_sec", 41.0),
+            max_batch_size=batching_cfg.get("max_batch_size", 512),
+            min_batch_size=batching_cfg.get("min_batch_size", 4),
+            num_buckets=train_cfg.get("num_buckets", 100),
+            shuffle=True,
+            drop_last=True,
+        )
+        dl_kwargs = {
+            "batch_sampler": sampler,
+            "num_workers": train_cfg.get("num_workers", 4),
+            "collate_fn": collate_fn,
+            "pin_memory": True,
+        }
+        nw = dl_kwargs["num_workers"]
+        if nw > 0:
+            dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
+        logger.info(
+            f"Dynamic batching: max_tokens={max_tokens}, "
+            f"{len(sampler)} batches, "
+            f"avg batch_size={len(durations)/len(sampler):.1f}"
+        )
+    else:
+        sampler = BucketShuffleSampler(
+            lengths=durations,
+            num_buckets=train_cfg.get("num_buckets", 100),
+            batch_size=batch_size,
+            shuffle=True,
+        )
+        dl_kwargs = {
+            "batch_size": batch_size,
+            "sampler": sampler,
+            "num_workers": train_cfg.get("num_workers", 4),
+            "collate_fn": collate_fn,
+            "pin_memory": True,
+            "drop_last": True,
+        }
+        nw = dl_kwargs["num_workers"]
+        if nw > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 4)
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, **dl_kwargs)
+
+    val_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": 2,
+        "collate_fn": collate_fn,
+        "pin_memory": True,
+    }
+    if val_kwargs["num_workers"] > 0:
+        val_kwargs["persistent_workers"] = True
+        val_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 4)
+
+    val_loader = torch.utils.data.DataLoader(val_dataset, **val_kwargs)
 
     steps_per_epoch = len(train_loader)
     scheduler = setup_scheduler(optimizer, opt_cfg, steps_per_epoch)
@@ -264,6 +366,9 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     ckpt_every = ckpt_cfg.get("every_n_steps", 2000)
     val_max_batches = train_cfg.get("validation", {}).get("max_batches", 50)
 
+    timer = _StepTimer()
+    accum_loss_sum = 0.0
+
     global_step = start_step
     epoch = 0
     model.train()
@@ -273,6 +378,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     logger.info(
         f"Starting training: {max_steps} steps, batch={batch_size}, "
         f"accum={accum_steps}, amp={use_amp}, device={device}"
+        + (f", max_tokens={max_tokens}" if max_tokens else "")
     )
 
     while global_step < max_steps:
@@ -284,11 +390,15 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
             if global_step >= max_steps:
                 break
 
+            timer.start()
+
             audio, audio_lengths, tokens, token_lengths = batch
             audio = audio.to(device, non_blocking=True)
             audio_lengths = audio_lengths.to(device)
             tokens = tokens.to(device, non_blocking=True)
             token_lengths = token_lengths.to(device)
+
+            timer.mark("h2d")
 
             orig_window = None
             if dynamic_window:
@@ -303,10 +413,14 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 )
                 loss = loss / accum_steps
 
+            timer.mark("forward")
+
             if orig_window is not None:
                 restore_window(model_cfg, orig_window)
 
             scaler.scale(loss).backward()
+
+            timer.mark("backward")
 
             if (batch_idx + 1) % accum_steps == 0:
                 scaler.unscale_(optimizer)
@@ -320,7 +434,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         f"Non-finite grad norm at step {global_step} "
                         f"({nonfinite_count}/{nonfinite_patience})"
                     )
-                    scaler.unscale_(optimizer)
+                    scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     if nonfinite_count >= nonfinite_patience:
                         logger.error(
@@ -345,31 +459,74 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+                timer.mark("optimizer")
+
+                step_loss = stats["loss"].item() if torch.is_tensor(stats["loss"]) else stats["loss"]
+                epoch_loss += step_loss
+                epoch_batches += 1
+                accum_loss_sum += step_loss
+
                 _log_gpu_temp(global_step)
 
-                epoch_loss += stats["loss"]
-                epoch_batches += 1
-
                 if global_step % log_every == 0:
+                    timings = timer.results_ms()
+
+                    loss_val = stats["loss"].item() if torch.is_tensor(stats["loss"]) else stats["loss"]
+                    loss_aed_val = stats["loss_aed"].item() if torch.is_tensor(stats["loss_aed"]) else stats["loss_aed"]
+                    loss_ctc_val = stats["loss_ctc"].item() if torch.is_tensor(stats["loss_ctc"]) else stats["loss_ctc"]
+                    acc_val = stats["acc"].item() if torch.is_tensor(stats["acc"]) else stats["acc"]
+
                     log_metrics = {
-                        "train/loss": stats["loss"],
-                        "train/loss_aed": stats["loss_aed"],
-                        "train/loss_ctc": stats["loss_ctc"],
-                        "train/acc": stats["acc"],
+                        "train/loss": loss_val,
+                        "train/loss_aed": loss_aed_val,
+                        "train/loss_ctc": loss_ctc_val,
+                        "train/acc": acc_val,
                         "train/grad_norm": grad_norm.item(),
                         "train/lr": optimizer.param_groups[0].get("lr", opt_cfg.get("lr", 1e-3)),
                         "train/step": global_step,
                         "train/epoch": epoch,
+                        "train/batch_size": audio.shape[0],
                     }
+
+                    for phase in ("h2d", "forward", "backward", "optimizer"):
+                        if phase in timings:
+                            log_metrics[f"timing/{phase}_ms"] = timings[phase]
+                    if "step_ms" in timings:
+                        log_metrics["timing/step_ms"] = timings["step_ms"]
+                        data_load_ms = timings["step_ms"] - sum(
+                            timings.get(p, 0) for p in ("h2d", "forward", "backward", "optimizer")
+                        )
+                        log_metrics["timing/data_load_ms"] = max(0, data_load_ms)
+                        total_compute = timings.get("forward", 0) + timings.get("backward", 0) + timings.get("optimizer", 0)
+                        if timings["step_ms"] > 0:
+                            log_metrics["timing/gpu_active_pct"] = total_compute / timings["step_ms"] * 100
+
                     gs = _log_gpu_temp(global_step, force=True)
                     if gs:
                         log_metrics["sys/gpu_temp"] = gs["temp"]
                         log_metrics["sys/gpu_power"] = gs["power"]
+                        log_metrics["sys/gpu_util"] = gs["util"]
+                        log_metrics["sys/gpu_mem_pct"] = gs["mem_mib"] / gs["mem_total_mib"] * 100
+                        log_metrics["sys/gpu_mem_mib"] = gs["mem_mib"]
+
+                    pm = _gpu_mem_pytorch()
+                    if pm:
+                        log_metrics["sys/gpu_mem_pytorch_mb"] = pm["allocated_mb"]
+                        log_metrics["sys/gpu_mem_peak_mb"] = pm["peak_allocated_mb"]
+                        log_metrics["sys/gpu_mem_reserved_mb"] = pm["reserved_mb"]
+                        torch.cuda.reset_peak_memory_stats()
+
                     train_logger.log(log_metrics, global_step)
+
+                    timing_str = ""
+                    if "timing/data_load_ms" in log_metrics:
+                        timing_str = f" data={log_metrics['timing/data_load_ms']:.0f}ms fwd={log_metrics.get('timing/forward_ms', 0):.0f}ms"
+                    bs_str = f" bs={audio.shape[0]}" if max_tokens else ""
                     logger.info(
-                        f"[step {global_step}] loss={stats['loss']:.4f} "
-                        f"aed={stats['loss_aed']:.4f} ctc={stats['loss_ctc']:.4f} "
-                        f"acc={stats['acc']:.3f} grad={grad_norm.item():.2f}"
+                        f"[step {global_step}] loss={loss_val:.4f} "
+                        f"aed={loss_aed_val:.4f} ctc={loss_ctc_val:.4f} "
+                        f"acc={acc_val:.3f} grad={grad_norm.item():.2f}"
+                        f"{bs_str}{timing_str}"
                     )
 
                 if global_step % val_every == 0:
@@ -377,6 +534,12 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         model, val_loader, sp, device, max_batches=val_max_batches
                     )
                     val_wer = val_metrics["wer"]
+
+                    gs = _gpu_stats()
+                    vram_str = ""
+                    if gs:
+                        vram_str = f" VRAM={gs['mem_mib'] / gs['mem_total_mib'] * 100:.0f}%"
+
                     train_logger.log(
                         {
                             "val/loss": val_metrics["val_loss"],
@@ -387,7 +550,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                     )
                     logger.info(
                         f"[step {global_step}] val_loss={val_metrics['val_loss']:.4f} "
-                        f"WER={val_wer:.2f}% SER={val_metrics['ser']:.2f}%"
+                        f"WER={val_wer:.2f}% SER={val_metrics['ser']:.2f}%{vram_str}"
                     )
 
                     if val_wer < best_wer:
@@ -415,7 +578,11 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 f"Epoch {epoch} done: avg_loss={avg_loss:.4f}, step={global_step}"
             )
 
-    logger.info(f"Training complete. Best WER: {best_wer:.2f}%")
+    gs = _gpu_stats()
+    peak_str = f"Peak VRAM: {_peak_vram_mib:.0f}MB"
+    if gs:
+        peak_str += f" ({_peak_vram_mib / gs['mem_total_mib'] * 100:.0f}% of {gs['mem_total_mib']:.0f}MB)"
+    logger.info(f"Training complete. Best WER: {best_wer:.2f}%. {peak_str}")
 
     if ckpt_mgr.checkpoint_paths:
         avg_path = str(Path(ckpt_dir) / "averaged.pt")
@@ -436,9 +603,15 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
     )
+    faulthandler.enable()
 
-    train(args.config, resume=not args.no_resume, seed=args.seed)
+    try:
+        train(args.config, resume=not args.no_resume, seed=args.seed)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Training failed: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

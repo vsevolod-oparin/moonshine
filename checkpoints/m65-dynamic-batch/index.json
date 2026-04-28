@@ -1,0 +1,12 @@
+[
+  {
+    "path": "checkpoints/m65-dynamic-batch/ckpt-step5000.pt",
+    "step": 5000,
+    "metric": 76.96526508226691
+  },
+  {
+    "path": "checkpoints/m65-dynamic-batch/ckpt-step2500.pt",
+    "step": 2500,
+    "metric": 86.28884826325411
+  }
+]

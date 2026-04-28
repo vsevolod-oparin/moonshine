@@ -219,14 +219,15 @@ class ASRDataset(Dataset):
         if self.speed_perturb:
             audio = self.speed_perturb(audio)
 
-        text = record["text"]
-
-        if self.tokenizer:
-            token_ids = self.tokenizer.encode(text, out_type=int)
+        if "token_ids" in record:
+            token_ids = [t for t in record["token_ids"] if t >= 6]
+            tokens = torch.tensor(token_ids, dtype=torch.long)
+        elif self.tokenizer:
+            token_ids = self.tokenizer.encode(record["text"], out_type=int)
             token_ids = [t for t in token_ids if t >= 6]
             tokens = torch.tensor(token_ids, dtype=torch.long)
         else:
-            tokens = text
+            tokens = record["text"]
 
         if self.raw_audio:
             return torch.from_numpy(audio).float(), tokens
