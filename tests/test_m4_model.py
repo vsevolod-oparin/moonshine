@@ -55,7 +55,7 @@ class TestT2BackwardPass:
         assert grad_norm < 1e6, f"Exploding grad norm: {grad_norm}"
 
     def test_v21_tiny_backward(self, v21_tiny):
-        v21_tiny.encoder.stochastic_depth = False
+        v21_tiny.encoder._drop_rates = [0.0] * len(v21_tiny.encoder._drop_rates)
         audio = torch.randn(2, 80000)
         tokens = torch.randint(0, 256, (2, 20))
         loss, stats, weight = v21_tiny(audio, tokens)

@@ -46,7 +46,7 @@ def load_test_sentences():
     return sentences
 
 
-def test_roundtrip(sp, sentences, label):
+def check_roundtrip(sp, sentences, label):
     passed = 0
     failed = 0
     failures = []
@@ -80,7 +80,7 @@ def main():
         model_path = str(DATA_DIR / f"tokenizer_{vocab_size}.model")
         sp = spm.SentencePieceProcessor()
         sp.Load(model_path)
-        ok = test_roundtrip(sp, sentences, f"vocab={vocab_size}")
+        ok = check_roundtrip(sp, sentences, f"vocab={vocab_size}")
         all_pass = all_pass and ok
 
     if all_pass:

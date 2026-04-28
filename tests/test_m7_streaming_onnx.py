@@ -38,6 +38,7 @@ def _encode_streaming(model: RuMoonshine, audio: torch.Tensor, chunk_size: int =
 class TestT9StreamingParity:
     @pytest.fixture
     def v2_tiny(self):
+        torch.manual_seed(0)
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
@@ -142,6 +143,7 @@ class TestT9StreamingParity:
 class TestT10TTFTBounded:
     @pytest.fixture
     def v2_tiny(self):
+        torch.manual_seed(0)
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
@@ -212,6 +214,7 @@ class TestT10TTFTBounded:
 class TestT11KVCacheCorrectness:
     @pytest.fixture
     def v2_tiny(self):
+        torch.manual_seed(0)
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
@@ -273,6 +276,7 @@ class TestT11KVCacheCorrectness:
 class TestT14ONNXExport:
     @pytest.fixture
     def v2_tiny(self):
+        torch.manual_seed(0)
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
@@ -410,6 +414,7 @@ class TestT14ONNXExport:
 class TestT15ONNXStreaming:
     @pytest.fixture
     def v2_tiny(self):
+        torch.manual_seed(0)
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
@@ -502,6 +507,7 @@ class TestT15ONNXStreaming:
 class TestT18INT8Quantization:
     @pytest.fixture
     def v2_tiny(self):
+        torch.manual_seed(0)
         model = RuMoonshine(PRESETS["v2_tiny"])
         model.eval()
         return model
