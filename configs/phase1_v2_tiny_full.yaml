@@ -54,6 +54,8 @@ training:
   validation:
     every_n_steps: 4000
     max_batches: 200
+    escape_wer_patience: 5
+    escape_wer_min_steps: 40000
   checkpointing:
     every_n_steps: 4000
     save_top_k: 5

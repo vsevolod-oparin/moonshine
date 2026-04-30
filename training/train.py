@@ -353,6 +353,11 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     nonfinite_patience = 5
     nonfinite_count = 0
+    escape_wer_patience = train_cfg.get("validation", {}).get("escape_wer_patience", 0)
+    escape_wer_min_steps = train_cfg.get("validation", {}).get("escape_wer_min_steps", 5000)
+    escape_wer_counter = 0
+    last_val_wer = float("inf")
+    escape_wer_stopped = False
     log_every = train_cfg.get("log_every", 100)
     val_every = train_cfg.get("validation", {}).get("every_n_steps", 2000)
     ckpt_every = ckpt_cfg.get("every_n_steps", 2000)
@@ -562,6 +567,24 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                     if is_schedulefree:
                         optimizer.train()
 
+                    if escape_wer_patience > 0 and global_step >= escape_wer_min_steps:
+                        if val_wer > last_val_wer:
+                            escape_wer_counter += 1
+                            logger.info(
+                                f"WER increased ({escape_wer_counter}/{escape_wer_patience}): "
+                                f"{last_val_wer:.2f}% -> {val_wer:.2f}%"
+                            )
+                            if escape_wer_counter >= escape_wer_patience:
+                                logger.warning(
+                                    f"Early stopping: WER increased for {escape_wer_patience} "
+                                    f"consecutive validations. Best WER={best_wer:.2f}% at step {global_step}"
+                                )
+                                escape_wer_stopped = True
+                                break
+                        else:
+                            escape_wer_counter = 0
+                    last_val_wer = val_wer
+
                 if global_step % ckpt_every == 0 and global_step % val_every != 0:
                     ckpt_mgr.save_latest(
                         model, optimizer, scheduler, global_step, scaler
@@ -573,11 +596,16 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 f"Epoch {epoch} done: avg_loss={avg_loss:.4f}, step={global_step}"
             )
 
+        if escape_wer_stopped:
+            ckpt_mgr.save_latest(model, optimizer, scheduler, global_step, scaler)
+            break
+
+    stopped_msg = " (early stopped)" if escape_wer_stopped else ""
     gs = _gpu_stats()
     peak_str = f"Peak VRAM: {_peak_vram_mib:.0f}MB"
     if gs:
         peak_str += f" ({_peak_vram_mib / gs['mem_total_mib'] * 100:.0f}% of {gs['mem_total_mib']:.0f}MB)"
-    logger.info(f"Training complete. Best WER: {best_wer:.2f}%. {peak_str}")
+    logger.info(f"Training complete{stopped_msg}. Best WER: {best_wer:.2f}%. {peak_str}")
 
     if ckpt_mgr.checkpoint_paths:
         avg_path = str(Path(ckpt_dir) / "averaged.pt")
