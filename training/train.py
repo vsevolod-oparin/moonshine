@@ -212,6 +212,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.enable_cudnn_sdp(False)
     data_cfg = full_cfg.get("data", {})
     log_cfg = full_cfg.get("logging", {})
     opt_cfg = train_cfg.get("optimizer", {})
@@ -227,8 +228,10 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     grad_clip = train_cfg.get("grad_clip", 5.0)
     dynamic_window = train_cfg.get("dynamic_window", False)
 
-    use_amp = train_cfg.get("precision", "fp16") == "fp16" and device.type == "cuda"
-    scaler = GradScaler("cuda", enabled=use_amp)
+    precision = train_cfg.get("precision", "fp16")
+    use_amp = precision in ("fp16", "bf16") and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    scaler = GradScaler("cuda", enabled=(precision == "fp16"))
 
     optimizer = setup_optimizer(model, opt_cfg)
     is_schedulefree = "schedulefree" in opt_cfg.get("name", "").lower()
@@ -404,7 +407,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
             if dynamic_window:
                 orig_window = sample_dynamic_window(model_cfg)
 
-            with autocast(device_type="cuda", enabled=use_amp):
+            with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 loss, stats, weight = model(
                     audio,
                     tokens,
