@@ -1,0 +1,27 @@
+[
+  {
+    "path": "checkpoints/phase1-v2-tiny/ckpt-step50000.pt",
+    "step": 50000,
+    "metric": 64.44444444444444
+  },
+  {
+    "path": "checkpoints/phase1-v2-tiny/ckpt-step48000.pt",
+    "step": 48000,
+    "metric": 64.91228070175438
+  },
+  {
+    "path": "checkpoints/phase1-v2-tiny/ckpt-step38000.pt",
+    "step": 38000,
+    "metric": 65.73099415204679
+  },
+  {
+    "path": "checkpoints/phase1-v2-tiny/ckpt-step32000.pt",
+    "step": 32000,
+    "metric": 66.19883040935673
+  },
+  {
+    "path": "checkpoints/phase1-v2-tiny/ckpt-step30000.pt",
+    "step": 30000,
+    "metric": 67.01754385964912
+  }
+]
