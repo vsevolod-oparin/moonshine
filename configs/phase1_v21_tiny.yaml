@@ -40,7 +40,7 @@ training:
     max_steps: 100000
   batch_size: 1
   val_batch_size: 32
-  accum_steps: 2
+  accum_steps: 1
   max_steps: 100000
   grad_clip: 5.0
   precision: bf16
@@ -52,7 +52,7 @@ training:
     spec_augment: true
     speed_perturbation: true
   batching:
-    max_tokens: 24000
+    max_tokens: 48000
     frames_per_sec: 41.0
     max_batch_size: 512
     min_batch_size: 4

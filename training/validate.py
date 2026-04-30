@@ -74,7 +74,7 @@ def ctc_greedy_decode(
     return results
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def validate(
     model: torch.nn.Module,
     val_loader,
