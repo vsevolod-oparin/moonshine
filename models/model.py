@@ -1,5 +1,7 @@
 from typing import Optional
 
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,6 +57,12 @@ class RuMoonshine(nn.Module):
         self.ctc_head = nn.Linear(config.enc_dim, config.vocab_size)
         self.lm_head = nn.Linear(config.dec_dim, config.vocab_size, bias=False)
 
+        self.spec_augment = False
+        self._spec_aug_freq_mask = 15
+        self._spec_aug_time_mask = 50
+        self._spec_aug_n_freq = 2
+        self._spec_aug_n_time = 2
+
         self.apply(init_weights)
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
@@ -62,9 +70,25 @@ class RuMoonshine(nn.Module):
         self, audio: torch.Tensor, audio_lengths: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x, out_lengths = self.preprocessor(audio, audio_lengths)
+        if self.training and self.spec_augment:
+            x = self._apply_spec_augment(x)
         with torch.amp.autocast("cuda", enabled=False):
             enc_output = self.encoder(x, out_lengths)
         return enc_output, out_lengths
+
+    def _apply_spec_augment(self, x: torch.Tensor) -> torch.Tensor:
+        batch, n_frames, feat_dim = x.shape
+        for _ in range(self._spec_aug_n_freq):
+            f = random.randint(0, self._spec_aug_freq_mask)
+            if f > 0:
+                f0 = random.randint(0, feat_dim - f)
+                x[:, :, f0:f0 + f] = 0
+        for _ in range(self._spec_aug_n_time):
+            t = random.randint(0, self._spec_aug_time_mask)
+            if t > 0:
+                t0 = random.randint(0, max(0, n_frames - t))
+                x[:, t0:t0 + t, :] = 0
+        return x
 
     def decode(
         self,

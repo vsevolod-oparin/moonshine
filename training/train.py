@@ -201,6 +201,11 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     model = RuMoonshine(model_cfg).to(device)
 
+    aug_cfg = train_cfg.get("augmentation", {})
+    model.spec_augment = aug_cfg.get("spec_augment", False)
+    if model.spec_augment:
+        logger.info("SpecAugment enabled (freq_mask=15, time_mask=50)")
+
     if train_cfg.get("compile", True) and device.type == "cuda":
         logger.info("Compiling encoder with torch.compile (mode=reduce-overhead)")
         model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
@@ -222,7 +227,6 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     val_manifest = data_cfg.get("val_manifest", "data/manifests/val.jsonl")
     tokenizer_model = data_cfg.get("tokenizer_model", "data/tokenizer_256.model")
 
-    aug_cfg = train_cfg.get("augmentation", {})
     train_dataset = ASRDataset(
         manifest_path=train_manifest,
         tokenizer_model=tokenizer_model,
@@ -287,7 +291,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
         nw = dl_kwargs["num_workers"]
         if nw > 0:
             dl_kwargs["persistent_workers"] = True
-            dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 4)
+            dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, **dl_kwargs)
 
@@ -302,7 +306,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     }
     if val_kwargs["num_workers"] > 0:
         val_kwargs["persistent_workers"] = True
-        val_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 4)
+        val_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
 
     val_loader = torch.utils.data.DataLoader(val_dataset, **val_kwargs)
 
@@ -443,7 +447,6 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                     scheduler.step()
 
                 optimizer.zero_grad(set_to_none=True)
-                accum_stats_buf = {"loss": 0.0, "loss_aed": 0.0, "loss_ctc": 0.0, "acc": 0.0}
                 global_step += 1
 
                 timer.mark("optimizer")
@@ -515,6 +518,8 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         f"acc={acc_val:.3f} grad={grad_norm.item():.2f}"
                         f"{bs_str}{timing_str}"
                     )
+
+                accum_stats_buf = {"loss": 0.0, "loss_aed": 0.0, "loss_ctc": 0.0, "acc": 0.0}
 
                 if global_step % val_every == 0:
                     val_metrics = validate(
