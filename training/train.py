@@ -191,6 +191,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.set_float32_matmul_precision("high")
     data_cfg = full_cfg.get("data", {})
     log_cfg = full_cfg.get("logging", {})
     opt_cfg = train_cfg.get("optimizer", {})
@@ -199,6 +200,10 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     logger.info(f"Using device: {device}")
 
     model = RuMoonshine(model_cfg).to(device)
+
+    if train_cfg.get("compile", True) and device.type == "cuda":
+        logger.info("Compiling encoder with torch.compile (mode=reduce-overhead)")
+        model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
 
     batch_size = train_cfg.get("batch_size", 16)
     accum_steps = train_cfg.get("accum_steps", 4)
@@ -257,6 +262,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
         }
         nw = dl_kwargs["num_workers"]
         if nw > 0:
+            dl_kwargs["persistent_workers"] = True
             dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
         logger.info(
             f"Dynamic batching: max_tokens={max_tokens}, "

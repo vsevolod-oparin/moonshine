@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Optional
 
 
+def clean_state_dict(state_dict: dict) -> dict:
+    return {k.replace("._orig_mod", ""): v for k, v in state_dict.items()}
+
+
 class CheckpointManager:
     def __init__(
         self,
@@ -55,7 +59,7 @@ class CheckpointManager:
         state = {
             "step": step,
             "metric": metric,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": clean_state_dict(model.state_dict()),
             "optimizer_state_dict": optimizer.state_dict(),
         }
         if scheduler is not None:
@@ -140,7 +144,7 @@ class CheckpointManager:
         path = str(self.save_dir / "latest.pt")
         state = {
             "step": step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": clean_state_dict(model.state_dict()),
             "optimizer_state_dict": optimizer.state_dict(),
         }
         if scheduler is not None:
