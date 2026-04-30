@@ -33,40 +33,42 @@ model:
 
 training:
   optimizer:
-    name: schedulefree
-    lr: 0.001
+    name: adamw
+    lr: 0.0005
     weight_decay: 0.01
-  batch_size: 16
-  accum_steps: 4
-  max_steps: 50000
+    warmup_steps: 2000
+    max_steps: 100000
+  batch_size: 1
+  val_batch_size: 32
+  accum_steps: 2
+  max_steps: 100000
   grad_clip: 5.0
-  warmup_steps: 2000
-
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 4
+  num_buckets: 100
   augmentation:
     spec_augment: true
-    time_mask_width: 0.05
-    freq_mask_width: 15
-    n_time_masks: 2
-    n_freq_masks: 2
     speed_perturbation: true
-    speed_factors: [0.9, 1.0, 1.1]
-    warmup_steps: 5000
-
+  batching:
+    max_tokens: 13000
+    frames_per_sec: 41.0
+    max_batch_size: 512
+    min_batch_size: 4
+  log_every: 100
   validation:
     every_n_steps: 2000
-    max_batches: 50
-
+    max_batches: 100
   checkpointing:
     every_n_steps: 2000
     save_top_k: 5
 
 logging:
-  backend: wandb
+  backend: tensorboard
   project: ru-moonshine
-  name: v21-tiny-phase1
+  name: v21-tiny
 
 data:
-  train_manifest: data/manifests/train.jsonl
-  val_manifest: data/manifests/val.jsonl
+  train_manifest: data/manifests/train_tokenized.jsonl
+  val_manifest: data/manifests/val_tokenized.jsonl
   tokenizer_model: data/tokenizer_256.model
-  mixing_temperature: 5.0

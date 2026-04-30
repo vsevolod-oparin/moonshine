@@ -147,12 +147,11 @@ def load_full_config(path: str) -> tuple[ModelConfig, dict]:
 
 
 class _StepTimer:
-    __slots__ = ("_events", "_t0", "_cpu_t0", "_labels")
+    __slots__ = ("_events", "_cpu_t0", "_labels")
 
     def __init__(self):
         self._events = []
         self._labels = []
-        self._t0 = None
         self._cpu_t0 = None
 
     def start(self):
@@ -528,12 +527,14 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                             "val/loss": val_metrics["val_loss"],
                             "val/wer": val_wer,
                             "val/ser": val_metrics["ser"],
+                            "val/cer": val_metrics.get("cer", 0.0),
                         },
                         global_step,
                     )
                     logger.info(
                         f"[step {global_step}] val_loss={val_metrics['val_loss']:.4f} "
-                        f"WER={val_wer:.2f}% SER={val_metrics['ser']:.2f}%{vram_str}"
+                        f"WER={val_wer:.2f}% SER={val_metrics['ser']:.2f}% "
+                        f"CER={val_metrics.get('cer', 0.0):.1f}%{vram_str}"
                     )
 
                     if val_wer < best_wer:

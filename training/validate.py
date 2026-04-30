@@ -89,6 +89,8 @@ def validate(
     stats = ErrorRateStats()
     total_loss = 0.0
     total_batches = 0
+    all_refs = []
+    all_hyps = []
 
     for batch_idx, batch in enumerate(val_loader):
         if max_batches is not None and batch_idx >= max_batches:
@@ -137,9 +139,12 @@ def validate(
             references.append(ref_text)
 
         stats.update(references, hypotheses)
+        all_refs.extend(references)
+        all_hyps.extend(hypotheses)
 
     model.train()
 
     result = stats.summary()
     result["val_loss"] = total_loss / max(total_batches, 1)
+    result["cer"] = jiwer.cer(all_refs, all_hyps) * 100 if all_refs else 0.0
     return result

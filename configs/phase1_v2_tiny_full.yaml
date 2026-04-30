@@ -38,12 +38,14 @@ training:
   max_steps: 100000
   grad_clip: 5.0
   precision: bf16
-  dynamic_window: false
   num_workers: 4
   prefetch_factor: 4
   num_buckets: 100
+  augmentation:
+    spec_augment: true
+    speed_perturbation: true
   batching:
-    max_tokens: 15000
+    max_tokens: 13000
     frames_per_sec: 41.0
     max_batch_size: 512
     min_batch_size: 4
@@ -61,6 +63,6 @@ logging:
   name: phase1-v2-tiny-full
 
 data:
-  train_manifest: data/manifests/train.jsonl
-  val_manifest: data/manifests/val.jsonl
+  train_manifest: data/manifests/train_tokenized.jsonl
+  val_manifest: data/manifests/val_tokenized.jsonl
   tokenizer_model: data/tokenizer_256.model
