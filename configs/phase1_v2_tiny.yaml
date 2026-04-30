@@ -33,6 +33,7 @@ training:
     warmup_steps: 1000
     max_steps: 50000
   batch_size: 1
+  val_batch_size: 32
   accum_steps: 2
   max_steps: 50000
   grad_clip: 5.0

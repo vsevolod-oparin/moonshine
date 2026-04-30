@@ -147,6 +147,12 @@ class CheckpointManager:
             state["scheduler_state_dict"] = scheduler.state_dict()
         if scaler is not None:
             state["scaler_state_dict"] = scaler.state_dict()
+        try:
+            state["rng_state"] = torch.random.get_rng_state()
+            if torch.cuda.is_available():
+                state["cuda_rng_state"] = torch.cuda.get_rng_state()
+        except Exception:
+            pass
         torch.save(state, path)
 
     def install_preemption_handler(self, save_fn):

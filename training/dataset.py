@@ -5,8 +5,6 @@ Reads manifests, loads audio, applies configurable augmentation.
 
 import json
 import random
-import re
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -279,7 +277,7 @@ def collate_fn(batch):
         text_lengths = torch.tensor(text_lengths, dtype=torch.long)
         return audio_batch, audio_lengths, texts_batch, text_lengths
 
-    return audio_batch, audio_lengths, texts
+    return audio_batch, audio_lengths, texts, None
 
 
 def create_dataloader(

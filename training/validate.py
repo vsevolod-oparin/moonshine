@@ -81,8 +81,11 @@ def validate(
     tokenizer,
     device: torch.device,
     max_batches: Optional[int] = None,
+    precision: str = "fp32",
 ) -> dict:
     model.eval()
+    use_autocast = precision in ("fp16", "bf16") and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     stats = ErrorRateStats()
     total_loss = 0.0
     total_batches = 0
@@ -97,10 +100,11 @@ def validate(
         tokens = tokens.to(device)
         token_lengths = token_lengths.to(device)
 
-        enc_output, enc_lengths = model.encode(audio, audio_lengths)
-        ctc_logits = model.ctc_head(enc_output)
+        with torch.amp.autocast("cuda", enabled=use_autocast, dtype=amp_dtype):
+            enc_output, enc_lengths = model.encode(audio, audio_lengths)
+            ctc_logits = model.ctc_head(enc_output)
 
-        ctc_log_probs = torch.nn.functional.log_softmax(ctc_logits, dim=-1).transpose(0, 1)
+            ctc_log_probs = torch.nn.functional.log_softmax(ctc_logits, dim=-1).transpose(0, 1)
         if enc_lengths is None:
             enc_lengths = torch.full(
                 (enc_output.size(0),),

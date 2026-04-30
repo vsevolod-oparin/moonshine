@@ -139,38 +139,21 @@ def load_full_config(path: str) -> tuple[ModelConfig, dict]:
     with open(path) as f:
         data = yaml.safe_load(f)
 
-    known = {f.name for f in ModelConfig.__dataclass_fields__.values()}
+    known = set(ModelConfig.__dataclass_fields__.keys())
     model_data = data.get("model", {})
     model_cfg = ModelConfig(**{k: v for k, v in model_data.items() if k in known})
 
     return model_cfg, data
 
 
-def sample_dynamic_window(model_cfg: ModelConfig):
-    w_left = random.randint(8, 16)
-    w_right_fl = random.randint(0, 4)
-    w_right_mid = random.choice([0, w_right_fl]) if random.random() < 0.5 else 0
-
-    orig = (model_cfg.window_left, model_cfg.window_right_first_last, model_cfg.window_right_middle)
-    model_cfg.window_left = w_left
-    model_cfg.window_right_first_last = w_right_fl
-    model_cfg.window_right_middle = w_right_mid
-    return orig
-
-
-def restore_window(model_cfg: ModelConfig, orig: tuple):
-    model_cfg.window_left, model_cfg.window_right_first_last, model_cfg.window_right_middle = orig
-
-
 class _StepTimer:
-    __slots__ = ("_events", "_t0", "_cpu_t0", "_labels", "_cur_label")
+    __slots__ = ("_events", "_t0", "_cpu_t0", "_labels")
 
     def __init__(self):
         self._events = []
         self._labels = []
         self._t0 = None
         self._cpu_t0 = None
-        self._cur_label = None
 
     def start(self):
         self._events.clear()
@@ -179,16 +162,12 @@ class _StepTimer:
         e = torch.cuda.Event(enable_timing=True)
         e.record()
         self._events.append(e)
-        self._cur_label = None
 
     def mark(self, label: str):
         self._labels.append(label)
         e = torch.cuda.Event(enable_timing=True)
         e.record()
         self._events.append(e)
-
-    def cpu_mark(self, label: str):
-        self._labels.append(label)
 
     def results_ms(self):
         if len(self._events) < 2:
@@ -226,7 +205,6 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     accum_steps = train_cfg.get("accum_steps", 4)
     max_steps = train_cfg.get("max_steps", 50000)
     grad_clip = train_cfg.get("grad_clip", 5.0)
-    dynamic_window = train_cfg.get("dynamic_window", False)
 
     precision = train_cfg.get("precision", "fp16")
     use_amp = precision in ("fp16", "bf16") and device.type == "cuda"
@@ -308,8 +286,10 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     train_loader = torch.utils.data.DataLoader(train_dataset, **dl_kwargs)
 
+    val_batch_size = train_cfg.get("val_batch_size", batch_size)
+
     val_kwargs = {
-        "batch_size": batch_size,
+        "batch_size": val_batch_size,
         "shuffle": False,
         "num_workers": 2,
         "collate_fn": collate_fn,
@@ -371,6 +351,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     timer = _StepTimer()
     accum_loss_sum = 0.0
+    accum_stats_buf = {"loss": 0.0, "loss_aed": 0.0, "loss_ctc": 0.0, "acc": 0.0}
 
     global_step = start_step
     epoch = 0
@@ -403,10 +384,6 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
             timer.mark("h2d")
 
-            orig_window = None
-            if dynamic_window:
-                orig_window = sample_dynamic_window(model_cfg)
-
             with autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 loss, stats, weight = model(
                     audio,
@@ -418,8 +395,9 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
             timer.mark("forward")
 
-            if orig_window is not None:
-                restore_window(model_cfg, orig_window)
+            for k, v in stats.items():
+                if k in accum_stats_buf:
+                    accum_stats_buf[k] += v.item() if torch.is_tensor(v) else v
 
             scaler.scale(loss).backward()
 
@@ -460,11 +438,12 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                     scheduler.step()
 
                 optimizer.zero_grad(set_to_none=True)
+                accum_stats_buf = {"loss": 0.0, "loss_aed": 0.0, "loss_ctc": 0.0, "acc": 0.0}
                 global_step += 1
 
                 timer.mark("optimizer")
 
-                step_loss = stats["loss"].item() if torch.is_tensor(stats["loss"]) else stats["loss"]
+                step_loss = accum_stats_buf["loss"] / accum_steps
                 epoch_loss += step_loss
                 epoch_batches += 1
                 accum_loss_sum += step_loss
@@ -474,10 +453,10 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 if global_step % log_every == 0:
                     timings = timer.results_ms()
 
-                    loss_val = stats["loss"].item() if torch.is_tensor(stats["loss"]) else stats["loss"]
-                    loss_aed_val = stats["loss_aed"].item() if torch.is_tensor(stats["loss_aed"]) else stats["loss_aed"]
-                    loss_ctc_val = stats["loss_ctc"].item() if torch.is_tensor(stats["loss_ctc"]) else stats["loss_ctc"]
-                    acc_val = stats["acc"].item() if torch.is_tensor(stats["acc"]) else stats["acc"]
+                    loss_val = accum_stats_buf["loss"] / accum_steps
+                    loss_aed_val = accum_stats_buf["loss_aed"] / accum_steps
+                    loss_ctc_val = accum_stats_buf["loss_ctc"] / accum_steps
+                    acc_val = accum_stats_buf["acc"] / accum_steps
 
                     log_metrics = {
                         "train/loss": loss_val,
@@ -534,7 +513,8 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
                 if global_step % val_every == 0:
                     val_metrics = validate(
-                        model, val_loader, sp, device, max_batches=val_max_batches
+                        model, val_loader, sp, device,
+                        max_batches=val_max_batches, precision=precision,
                     )
                     val_wer = val_metrics["wer"]
 
