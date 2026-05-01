@@ -127,7 +127,13 @@ class CheckpointManager:
         map_location=None,
     ) -> int:
         state = torch.load(path, map_location=map_location, weights_only=False)
-        model.load_state_dict(state["model_state_dict"])
+        model_sd = state["model_state_dict"]
+        if hasattr(model.encoder, "_orig_mod"):
+            encoder_keys = [k for k in model_sd if k.startswith("encoder.")]
+            for k in encoder_keys:
+                new_k = k.replace("encoder.", "encoder._orig_mod.", 1)
+                model_sd[new_k] = model_sd.pop(k)
+        model.load_state_dict(model_sd)
         if optimizer is not None and "optimizer_state_dict" in state:
             optimizer.load_state_dict(state["optimizer_state_dict"])
         if scheduler is not None and "scheduler_state_dict" in state:
@@ -135,9 +141,15 @@ class CheckpointManager:
         if scaler is not None and "scaler_state_dict" in state:
             scaler.load_state_dict(state["scaler_state_dict"])
         if "rng_state" in state:
-            torch.random.set_rng_state(state["rng_state"])
+            try:
+                torch.random.set_rng_state(state["rng_state"])
+            except Exception:
+                pass
         if "cuda_rng_state" in state and torch.cuda.is_available():
-            torch.cuda.set_rng_state(state["cuda_rng_state"])
+            try:
+                torch.cuda.set_rng_state(state["cuda_rng_state"])
+            except Exception:
+                pass
         return state["step"]
 
     def save_latest(self, model, optimizer, scheduler, step, scaler=None):

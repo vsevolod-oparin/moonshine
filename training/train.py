@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import psutil
 import torch
 from torch.amp import GradScaler, autocast
 
@@ -52,6 +53,31 @@ def _gpu_stats():
         return None
 
 
+def _cpu_temp():
+    try:
+        temps = psutil.sensors_temperatures()
+        for name in ("k10temp", "coretemp", "cpu_thermal"):
+            if name in temps:
+                for entry in temps[name]:
+                    if entry.label in ("Tctl", "Package id 0", "") or "core" in entry.label.lower():
+                        return entry.current
+                return temps[name][0].current
+    except Exception:
+        pass
+    return None
+
+
+def _temp_str():
+    gpu = _gpu_stats()
+    cpu = _cpu_temp()
+    parts = []
+    if cpu is not None:
+        parts.append(f"CPU={cpu:.0f}C")
+    if gpu:
+        parts.append(f"GPU={gpu['temp']:.0f}C")
+    return " ".join(parts) if parts else ""
+
+
 def _gpu_mem_pytorch():
     if not torch.cuda.is_available():
         return None
@@ -62,30 +88,64 @@ def _gpu_mem_pytorch():
     }
 
 
-def _log_gpu_temp(step, force=False):
+_CPU_TEMP_WARN = 85
+_CPU_TEMP_CRIT = 95
+_THERMAL_RESUME = 70
+_THERMAL_POLL_SEC = 15
+
+
+def _max_temp():
+    gpu = _gpu_stats()
+    cpu = _cpu_temp()
+    temps = []
+    if cpu is not None:
+        temps.append(cpu)
+    if gpu:
+        temps.append(gpu["temp"])
+    return max(temps) if temps else None
+
+
+def _thermal_wait(step):
+    t = _max_temp()
+    if t is None or t < _CPU_TEMP_WARN:
+        return
+    ts = _temp_str()
+    logger.warning(f"[step {step}] THERMAL PAUSE: {ts} — waiting to cool below {_THERMAL_RESUME}C")
+    while True:
+        time.sleep(_THERMAL_POLL_SEC)
+        t = _max_temp()
+        ts = _temp_str()
+        logger.info(f"[step {step}] Thermal check: {ts}")
+        if t is None or t < _THERMAL_RESUME:
+            logger.info(f"[step {step}] Resuming training: {ts}")
+            break
+
+
+def _log_temps(step, force=False):
     global _last_gpu_log, _peak_vram_mib
     now = time.time()
     if not force and (now - _last_gpu_log) < 60:
-        return
-    gs = _gpu_stats()
-    if gs is None:
-        return
+        return None, None
     _last_gpu_log = now
-    mem_pct = gs["mem_mib"] / gs["mem_total_mib"] * 100
-    if gs["mem_mib"] > _peak_vram_mib:
+    gs = _gpu_stats()
+    cpu = _cpu_temp()
+    if gs and gs["mem_mib"] > _peak_vram_mib:
         _peak_vram_mib = gs["mem_mib"]
-    temp = gs["temp"]
-    if temp >= _GPU_TEMP_CRIT:
-        logger.warning(
-            f"[step {step}] GPU CRITICAL: {temp:.0f}C, {gs['power']:.0f}W, "
-            f"VRAM {mem_pct:.0f}% ({gs['mem_mib']:.0f}/{gs['mem_total_mib']:.0f}MB)"
-        )
-    elif temp >= _GPU_TEMP_WARN:
-        logger.warning(
-            f"[step {step}] GPU HOT: {temp:.0f}C, {gs['power']:.0f}W, "
-            f"VRAM {mem_pct:.0f}%"
-        )
-    return gs
+    ts = _temp_str()
+    if gs:
+        gpu_t = gs["temp"]
+        mem_pct = gs["mem_mib"] / gs["mem_total_mib"] * 100
+        if gpu_t >= _GPU_TEMP_CRIT or (cpu is not None and cpu >= _CPU_TEMP_CRIT):
+            logger.warning(
+                f"[step {step}] THERMAL CRITICAL: {ts}, "
+                f"{gs['power']:.0f}W, VRAM {mem_pct:.0f}%"
+            )
+        elif gpu_t >= _GPU_TEMP_WARN or (cpu is not None and cpu >= _CPU_TEMP_WARN):
+            logger.warning(
+                f"[step {step}] THERMAL WARNING: {ts}, "
+                f"{gs['power']:.0f}W, VRAM {mem_pct:.0f}%"
+            )
+    return gs, cpu
 
 
 def setup_optimizer(model, cfg: dict) -> torch.optim.Optimizer:
@@ -113,14 +173,38 @@ def setup_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
     if name == "schedulefree":
         return None
 
+    schedule = cfg.get("lr_schedule", "cosine").lower()
     warmup_steps = cfg.get("warmup_steps", 2000)
-    max_steps = cfg.get("max_steps", 50000)
+    min_lr_ratio = cfg.get("min_lr_ratio", 0.1)
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    if schedule == "wsd":
+        decay_start_step = cfg.get("decay_start_step", 150000)
+        decay_steps = cfg.get("decay_steps", 50000)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            if step < decay_start_step:
+                return 1.0
+            progress = (step - decay_start_step) / max(1, decay_steps)
+            progress = min(1.0, progress)
+            decay_mult = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(min_lr_ratio, decay_mult)
+
+    elif schedule == "noam":
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            return math.sqrt(warmup_steps) / math.sqrt(max(1, step))
+
+    else:
+        max_steps = cfg.get("max_steps", 50000)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+            return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -207,8 +291,8 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
         logger.info("SpecAugment enabled (freq_mask=15, time_mask=50)")
 
     if train_cfg.get("compile", True) and device.type == "cuda":
-        logger.info("Compiling encoder with torch.compile (mode=reduce-overhead)")
-        model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
+        logger.info("Compiling encoder with torch.compile (mode=default)")
+        model.encoder = torch.compile(model.encoder, mode="default")
 
     batch_size = train_cfg.get("batch_size", 16)
     accum_steps = train_cfg.get("accum_steps", 4)
@@ -461,7 +545,8 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 epoch_batches += 1
                 accum_loss_sum += step_loss
 
-                _log_gpu_temp(global_step)
+                _log_temps(global_step)
+                _thermal_wait(global_step)
 
                 if global_step % log_every == 0:
                     timings = timer.results_ms()
@@ -496,13 +581,15 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         if timings["step_ms"] > 0:
                             log_metrics["timing/gpu_active_pct"] = total_compute / timings["step_ms"] * 100
 
-                    gs = _log_gpu_temp(global_step, force=True)
+                    gs, cpu = _log_temps(global_step, force=True)
                     if gs:
                         log_metrics["sys/gpu_temp"] = gs["temp"]
                         log_metrics["sys/gpu_power"] = gs["power"]
                         log_metrics["sys/gpu_util"] = gs["util"]
                         log_metrics["sys/gpu_mem_pct"] = gs["mem_mib"] / gs["mem_total_mib"] * 100
                         log_metrics["sys/gpu_mem_mib"] = gs["mem_mib"]
+                    if cpu is not None:
+                        log_metrics["sys/cpu_temp"] = cpu
 
                     pm = _gpu_mem_pytorch()
                     if pm:
@@ -516,12 +603,14 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                     timing_str = ""
                     if "timing/data_load_ms" in log_metrics:
                         timing_str = f" data={log_metrics['timing/data_load_ms']:.0f}ms fwd={log_metrics.get('timing/forward_ms', 0):.0f}ms"
+                    ts = _temp_str()
+                    temp_str = f" {ts}" if ts else ""
                     bs_str = f" bs={audio.shape[0]}" if max_tokens else ""
                     logger.info(
                         f"[step {global_step}] loss={loss_val:.4f} "
                         f"aed={loss_aed_val:.4f} ctc={loss_ctc_val:.4f} "
                         f"acc={acc_val:.3f} grad={grad_norm.item():.2f}"
-                        f"{bs_str}{timing_str}"
+                        f"{bs_str}{timing_str}{temp_str}"
                     )
 
                 accum_stats_buf = {"loss": 0.0, "loss_aed": 0.0, "loss_ctc": 0.0, "acc": 0.0}
@@ -532,25 +621,36 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         max_batches=val_max_batches, precision=precision,
                     )
                     val_wer = val_metrics["wer"]
+                    val_aed_wer = val_metrics.get("wer_aed", -1)
 
                     gs = _gpu_stats()
-                    vram_str = ""
+                    cpu = _cpu_temp()
+                    sys_parts = []
+                    if cpu is not None:
+                        sys_parts.append(f"CPU={cpu:.0f}C")
                     if gs:
-                        vram_str = f" VRAM={gs['mem_mib'] / gs['mem_total_mib'] * 100:.0f}%"
+                        sys_parts.append(f"GPU={gs['temp']:.0f}C")
+                        sys_parts.append(f"VRAM={gs['mem_mib'] / gs['mem_total_mib'] * 100:.0f}%")
+                    sys_str = f" {' '.join(sys_parts)}" if sys_parts else ""
 
-                    train_logger.log(
-                        {
-                            "val/loss": val_metrics["val_loss"],
-                            "val/wer": val_wer,
-                            "val/ser": val_metrics["ser"],
-                            "val/cer": val_metrics.get("cer", 0.0),
-                        },
-                        global_step,
-                    )
+                    log_vals = {
+                        "val/loss": val_metrics["val_loss"],
+                        "val/wer": val_wer,
+                        "val/ser": val_metrics["ser"],
+                        "val/cer": val_metrics.get("cer", 0.0),
+                    }
+                    aed_str = ""
+                    if val_aed_wer >= 0:
+                        log_vals["val/wer_aed"] = val_aed_wer
+                        log_vals["val/ser_aed"] = val_metrics["ser_aed"]
+                        log_vals["val/cer_aed"] = val_metrics.get("cer_aed", 0.0)
+                        aed_str = f" AED_WER={val_aed_wer:.2f}%"
+                    train_logger.log(log_vals, global_step)
+
                     logger.info(
                         f"[step {global_step}] val_loss={val_metrics['val_loss']:.4f} "
                         f"WER={val_wer:.2f}% SER={val_metrics['ser']:.2f}% "
-                        f"CER={val_metrics.get('cer', 0.0):.1f}%{vram_str}"
+                        f"CER={val_metrics.get('cer', 0.0):.1f}%{aed_str}{sys_str}"
                     )
 
                     if val_wer < best_wer:

@@ -8,3 +8,4 @@ wandb>=0.19
 tensorboard>=2.18
 jiwer>=3.0
 num2words>=0.5.12
+psutil>=5.9

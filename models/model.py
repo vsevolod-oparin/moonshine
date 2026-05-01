@@ -156,7 +156,7 @@ class RuMoonshine(nn.Module):
                 zero_infinity=True,
             )
 
-            loss = loss_aed + self.config.ctc_weight * loss_ctc
+            loss = (1 - self.config.ctc_weight) * loss_aed + self.config.ctc_weight * loss_ctc
 
             stats = {
                 "loss": loss.detach(),

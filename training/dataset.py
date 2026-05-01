@@ -219,10 +219,12 @@ class ASRDataset(Dataset):
 
         if "token_ids" in record:
             token_ids = [t for t in record["token_ids"] if t >= 6]
+            token_ids.append(2)
             tokens = torch.tensor(token_ids, dtype=torch.long)
         elif self.tokenizer:
             token_ids = self.tokenizer.encode(record["text"], out_type=int)
             token_ids = [t for t in token_ids if t >= 6]
+            token_ids.append(2)
             tokens = torch.tensor(token_ids, dtype=torch.long)
         else:
             tokens = record["text"]
