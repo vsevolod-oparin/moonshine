@@ -1,0 +1,9 @@
+{
+  "model": "vosk-model-ru-0.22",
+  "samples": 11910,
+  "skipped": 0,
+  "elapsed_sec": 4125.3,
+  "wer": 13.65,
+  "cer": 4.24,
+  "ser": 40.32
+}

@@ -1,0 +1,10 @@
+{
+  "model": "whisper-tiny",
+  "samples": 11910,
+  "skipped": 0,
+  "elapsed_sec": 514.1,
+  "rate_per_sec": 23.2,
+  "wer": 66.78,
+  "cer": 28.58,
+  "ser": 91.53
+}

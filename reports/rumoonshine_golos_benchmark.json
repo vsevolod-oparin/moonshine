@@ -1,0 +1,10 @@
+{
+  "model": "rumoonshine-tiny-v2",
+  "checkpoint": "checkpoints/phase1-v2-tiny-full-v2/averaged.pt",
+  "samples": 11910,
+  "elapsed_sec": 226.3,
+  "rate_per_sec": 52.6,
+  "wer": 60.05,
+  "cer": 27.69,
+  "ser": 88.43
+}

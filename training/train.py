@@ -16,17 +16,13 @@ from torch.amp import GradScaler, autocast
 from models.config import ModelConfig
 from models.model import RuMoonshine
 from training.checkpoint import CheckpointManager, average_checkpoints
+from training.config import FullConfig, OptimizerConfig, ThermalConfig
 from training.dataset import ASRDataset, collate_fn, load_manifest
 from training.logger import TrainLogger
 from training.sampler import BucketShuffleSampler, DynamicBatchSampler
 from training.validate import validate
 
 logger = logging.getLogger(__name__)
-
-_GPU_TEMP_WARN = 85
-_GPU_TEMP_CRIT = 90
-_last_gpu_log = 0.0
-_peak_vram_mib = 0.0
 
 
 def _gpu_stats():
@@ -88,100 +84,100 @@ def _gpu_mem_pytorch():
     }
 
 
-_CPU_TEMP_WARN = 85
-_CPU_TEMP_CRIT = 95
-_THERMAL_RESUME = 70
-_THERMAL_POLL_SEC = 15
+class _ThermalMonitor:
+    def __init__(self, cfg: ThermalConfig):
+        self.cfg = cfg
+        self._last_gpu_log = 0.0
+        self._peak_vram_mib = 0.0
 
+    def _max_temp(self):
+        gpu = _gpu_stats()
+        cpu = _cpu_temp()
+        temps = []
+        if cpu is not None:
+            temps.append(cpu)
+        if gpu:
+            temps.append(gpu["temp"])
+        return max(temps) if temps else None
 
-def _max_temp():
-    gpu = _gpu_stats()
-    cpu = _cpu_temp()
-    temps = []
-    if cpu is not None:
-        temps.append(cpu)
-    if gpu:
-        temps.append(gpu["temp"])
-    return max(temps) if temps else None
-
-
-def _thermal_wait(step):
-    t = _max_temp()
-    if t is None or t < _CPU_TEMP_WARN:
-        return
-    ts = _temp_str()
-    logger.warning(f"[step {step}] THERMAL PAUSE: {ts} — waiting to cool below {_THERMAL_RESUME}C")
-    while True:
-        time.sleep(_THERMAL_POLL_SEC)
-        t = _max_temp()
+    def wait_if_hot(self, step):
+        t = self._max_temp()
+        if t is None or t < self.cfg.cpu_temp_warn:
+            return
         ts = _temp_str()
-        logger.info(f"[step {step}] Thermal check: {ts}")
-        if t is None or t < _THERMAL_RESUME:
-            logger.info(f"[step {step}] Resuming training: {ts}")
-            break
+        logger.warning(f"[step {step}] THERMAL PAUSE: {ts} — waiting to cool below {self.cfg.resume_temp:.0f}C")
+        while True:
+            time.sleep(self.cfg.poll_interval_sec)
+            t = self._max_temp()
+            ts = _temp_str()
+            logger.info(f"[step {step}] Thermal check: {ts}")
+            if t is None or t < self.cfg.resume_temp:
+                logger.info(f"[step {step}] Resuming training: {ts}")
+                break
+
+    def log(self, step, force=False):
+        now = time.time()
+        if not force and (now - self._last_gpu_log) < 60:
+            return None, None
+        self._last_gpu_log = now
+        gs = _gpu_stats()
+        cpu = _cpu_temp()
+        if gs and gs["mem_mib"] > self._peak_vram_mib:
+            self._peak_vram_mib = gs["mem_mib"]
+        ts = _temp_str()
+        if gs:
+            gpu_t = gs["temp"]
+            mem_pct = gs["mem_mib"] / gs["mem_total_mib"] * 100
+            if gpu_t >= self.cfg.gpu_temp_crit or (cpu is not None and cpu >= self.cfg.cpu_temp_crit):
+                logger.warning(
+                    f"[step {step}] THERMAL CRITICAL: {ts}, "
+                    f"{gs['power']:.0f}W, VRAM {mem_pct:.0f}%"
+                )
+            elif gpu_t >= self.cfg.gpu_temp_warn or (cpu is not None and cpu >= self.cfg.cpu_temp_warn):
+                logger.warning(
+                    f"[step {step}] THERMAL WARNING: {ts}, "
+                    f"{gs['power']:.0f}W, VRAM {mem_pct:.0f}%"
+                )
+        return gs, cpu
 
 
-def _log_temps(step, force=False):
-    global _last_gpu_log, _peak_vram_mib
-    now = time.time()
-    if not force and (now - _last_gpu_log) < 60:
-        return None, None
-    _last_gpu_log = now
-    gs = _gpu_stats()
-    cpu = _cpu_temp()
-    if gs and gs["mem_mib"] > _peak_vram_mib:
-        _peak_vram_mib = gs["mem_mib"]
-    ts = _temp_str()
-    if gs:
-        gpu_t = gs["temp"]
-        mem_pct = gs["mem_mib"] / gs["mem_total_mib"] * 100
-        if gpu_t >= _GPU_TEMP_CRIT or (cpu is not None and cpu >= _CPU_TEMP_CRIT):
-            logger.warning(
-                f"[step {step}] THERMAL CRITICAL: {ts}, "
-                f"{gs['power']:.0f}W, VRAM {mem_pct:.0f}%"
-            )
-        elif gpu_t >= _GPU_TEMP_WARN or (cpu is not None and cpu >= _CPU_TEMP_WARN):
-            logger.warning(
-                f"[step {step}] THERMAL WARNING: {ts}, "
-                f"{gs['power']:.0f}W, VRAM {mem_pct:.0f}%"
-            )
-    return gs, cpu
-
-
-def setup_optimizer(model, cfg: dict) -> torch.optim.Optimizer:
-    name = cfg.get("name", "schedulefree").lower()
-    lr = cfg.get("lr", 1e-3)
-    weight_decay = cfg.get("weight_decay", 0.01)
-
+def setup_optimizer(model, cfg: OptimizerConfig) -> torch.optim.Optimizer:
+    name = cfg.name.lower()
     if name == "schedulefree":
         from schedulefree import AdamWScheduleFree
 
         return AdamWScheduleFree(
-            model.parameters(), lr=lr, weight_decay=weight_decay, warmup_steps=0
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, warmup_steps=0
         )
     elif name == "adamw":
         fused = torch.cuda.is_available()
         return torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay, fused=fused
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=fused
         )
     else:
         raise ValueError(f"Unknown optimizer: {name}")
 
 
-def setup_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
-    name = cfg.get("name", "schedulefree").lower()
+def setup_scheduler(optimizer, cfg: OptimizerConfig, max_steps: int):
+    name = cfg.name.lower()
     if name == "schedulefree":
         return None
 
-    schedule = cfg.get("lr_schedule", "cosine").lower()
-    warmup_steps = cfg.get("warmup_steps", 2000)
-    min_lr_ratio = cfg.get("min_lr_ratio", 0.1)
+    schedule = cfg.lr_schedule.lower()
+    warmup_steps = cfg.warmup_steps
+    min_lr_ratio = cfg.min_lr_ratio
 
     if schedule == "wsd":
-        decay_start_step = cfg.get("decay_start_step", 150000)
-        decay_steps = cfg.get("decay_steps", 50000)
+        decay_start_step = cfg.decay_start_step
+        decay_steps = cfg.decay_steps
+        plateau_start_step = cfg.plateau_start_step
+        plateau_steps = cfg.plateau_steps
+        post_decay_steps = cfg.post_decay_steps
+        final_lr = cfg.final_lr
+        final_decay_start_step = cfg.final_decay_start_step
+        final_decay_steps = cfg.final_decay_steps
 
-        def lr_lambda(step):
+        def _wsd_lr(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
             if step < decay_start_step:
@@ -191,6 +187,25 @@ def setup_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
             decay_mult = 0.5 * (1.0 + math.cos(math.pi * progress))
             return max(min_lr_ratio, decay_mult)
 
+        def lr_lambda(step):
+            lr_mult = _wsd_lr(step)
+            if plateau_steps > 0 and step >= plateau_start_step:
+                plateau_end = plateau_start_step + plateau_steps
+                if step < plateau_end:
+                    return _wsd_lr(plateau_start_step)
+                plateau_lr = _wsd_lr(plateau_start_step)
+                post_steps = max(1, post_decay_steps) if post_decay_steps > 0 else max(1, max_steps - plateau_end)
+                progress = (step - plateau_end) / post_steps
+                progress = min(1.0, progress)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr_mult = min_lr_ratio + (plateau_lr - min_lr_ratio) * cosine
+            if final_decay_steps > 0 and step >= final_decay_start_step:
+                final_lr_mult = final_lr / cfg.lr
+                fprogress = (step - final_decay_start_step) / max(1, final_decay_steps)
+                fprogress = min(1.0, fprogress)
+                return min_lr_ratio + (final_lr_mult - min_lr_ratio) * fprogress
+            return lr_mult
+
     elif schedule == "noam":
         def lr_lambda(step):
             if step < warmup_steps:
@@ -198,8 +213,6 @@ def setup_scheduler(optimizer, cfg: dict, steps_per_epoch: int):
             return math.sqrt(warmup_steps) / math.sqrt(max(1, step))
 
     else:
-        max_steps = cfg.get("max_steps", 50000)
-
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
@@ -215,19 +228,6 @@ def setup_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def load_full_config(path: str) -> tuple[ModelConfig, dict]:
-    import yaml
-
-    with open(path) as f:
-        data = yaml.safe_load(f)
-
-    known = set(ModelConfig.__dataclass_fields__.keys())
-    model_data = data.get("model", {})
-    model_cfg = ModelConfig(**{k: v for k, v in model_data.items() if k in known})
-
-    return model_cfg, data
 
 
 class _StepTimer:
@@ -266,156 +266,152 @@ class _StepTimer:
 
 
 def train(config_path: str, resume: bool = True, seed: int = 42):
-    global _peak_vram_mib
-    setup_seed(seed)
+    cfg = FullConfig.from_yaml(config_path)
+    tc = cfg.training
+    opt = tc.optimizer
+    dc = cfg.data
+    lc = cfg.logging
+    ac = tc.augmentation
+    bc = tc.batching
+    vc = tc.validation
+    cc = tc.checkpointing
 
-    model_cfg, full_cfg = load_full_config(config_path)
-    train_cfg = full_cfg.get("training", {})
+    seed = tc.seed
+    setup_seed(seed)
+    torch.set_num_threads(tc.num_threads)
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.enable_cudnn_sdp(False)
         torch.set_float32_matmul_precision("high")
-    data_cfg = full_cfg.get("data", {})
-    log_cfg = full_cfg.get("logging", {})
-    opt_cfg = train_cfg.get("optimizer", {})
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
+    known = set(ModelConfig.__dataclass_fields__.keys())
+    model_cfg = ModelConfig(**{k: v for k, v in cfg.model.items() if k in known})
     model = RuMoonshine(model_cfg).to(device)
 
-    aug_cfg = train_cfg.get("augmentation", {})
-    model.spec_augment = aug_cfg.get("spec_augment", False)
+    model.spec_augment = ac.spec_augment
     if model.spec_augment:
         logger.info("SpecAugment enabled (freq_mask=15, time_mask=50)")
 
-    if train_cfg.get("compile", True) and device.type == "cuda":
+    if tc.compile and device.type == "cuda":
         logger.info("Compiling encoder with torch.compile (mode=default)")
         model.encoder = torch.compile(model.encoder, mode="default")
 
-    batch_size = train_cfg.get("batch_size", 16)
-    accum_steps = train_cfg.get("accum_steps", 4)
-    max_steps = train_cfg.get("max_steps", 50000)
-    grad_clip = train_cfg.get("grad_clip", 5.0)
+    max_steps = tc.max_steps
+    batch_size = tc.batch_size
+    accum_steps = tc.accum_steps
+    grad_clip = tc.grad_clip
 
-    precision = train_cfg.get("precision", "fp16")
+    precision = tc.precision
     use_amp = precision in ("fp16", "bf16") and device.type == "cuda"
     amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     scaler = GradScaler("cuda", enabled=(precision == "fp16"))
 
-    optimizer = setup_optimizer(model, opt_cfg)
-    is_schedulefree = "schedulefree" in opt_cfg.get("name", "").lower()
-
-    train_manifest = data_cfg.get("train_manifest", "data/manifests/train.jsonl")
-    val_manifest = data_cfg.get("val_manifest", "data/manifests/val.jsonl")
-    tokenizer_model = data_cfg.get("tokenizer_model", "data/tokenizer_256.model")
+    optimizer = setup_optimizer(model, opt)
+    is_schedulefree = "schedulefree" in opt.name.lower()
 
     train_dataset = ASRDataset(
-        manifest_path=train_manifest,
-        tokenizer_model=tokenizer_model,
+        manifest_path=dc.train_manifest,
+        tokenizer_model=dc.tokenizer_model,
         raw_audio=True,
         spec_augment=False,
-        speed_perturbation=aug_cfg.get("speed_perturbation", False),
+        speed_perturbation=ac.speed_perturbation,
     )
 
     val_dataset = ASRDataset(
-        manifest_path=val_manifest,
-        tokenizer_model=tokenizer_model,
+        manifest_path=dc.val_manifest,
+        tokenizer_model=dc.tokenizer_model,
         raw_audio=True,
     )
 
-    records = load_manifest(train_manifest)
+    records = load_manifest(dc.train_manifest)
     durations = [r.get("duration", 1.0) for r in records]
 
-    batching_cfg = train_cfg.get("batching", {})
-    max_tokens = batching_cfg.get("max_tokens", None)
+    thermal = _ThermalMonitor(tc.thermal)
 
-    if max_tokens is not None:
+    if bc.max_tokens is not None:
         sampler = DynamicBatchSampler(
             lengths=durations,
-            max_tokens=max_tokens,
-            frames_per_sec=batching_cfg.get("frames_per_sec", 41.0),
-            max_batch_size=batching_cfg.get("max_batch_size", 512),
-            min_batch_size=batching_cfg.get("min_batch_size", 4),
-            num_buckets=train_cfg.get("num_buckets", 100),
+            max_tokens=bc.max_tokens,
+            frames_per_sec=bc.frames_per_sec,
+            max_batch_size=bc.max_batch_size,
+            min_batch_size=bc.min_batch_size,
+            num_buckets=tc.num_buckets,
             shuffle=True,
             drop_last=True,
         )
         dl_kwargs = {
             "batch_sampler": sampler,
-            "num_workers": train_cfg.get("num_workers", 4),
+            "num_workers": tc.num_workers,
             "collate_fn": collate_fn,
             "pin_memory": True,
         }
-        nw = dl_kwargs["num_workers"]
-        if nw > 0:
+        if tc.num_workers > 0:
             dl_kwargs["persistent_workers"] = True
-            dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
+            dl_kwargs["prefetch_factor"] = tc.prefetch_factor
         logger.info(
-            f"Dynamic batching: max_tokens={max_tokens}, "
+            f"Dynamic batching: max_tokens={bc.max_tokens}, "
             f"{len(sampler)} batches, "
             f"avg batch_size={len(durations)/len(sampler):.1f}"
         )
     else:
         sampler = BucketShuffleSampler(
             lengths=durations,
-            num_buckets=train_cfg.get("num_buckets", 100),
+            num_buckets=tc.num_buckets,
             batch_size=batch_size,
             shuffle=True,
         )
         dl_kwargs = {
             "batch_size": batch_size,
             "sampler": sampler,
-            "num_workers": train_cfg.get("num_workers", 4),
+            "num_workers": tc.num_workers,
             "collate_fn": collate_fn,
             "pin_memory": True,
             "drop_last": True,
         }
-        nw = dl_kwargs["num_workers"]
-        if nw > 0:
+        if tc.num_workers > 0:
             dl_kwargs["persistent_workers"] = True
-            dl_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
+            dl_kwargs["prefetch_factor"] = tc.prefetch_factor
 
     train_loader = torch.utils.data.DataLoader(train_dataset, **dl_kwargs)
 
-    val_batch_size = train_cfg.get("val_batch_size", batch_size)
-
+    val_batch_size = tc.get_val_batch_size()
     val_kwargs = {
         "batch_size": val_batch_size,
         "shuffle": False,
-        "num_workers": 2,
+        "num_workers": tc.val_num_workers,
         "collate_fn": collate_fn,
         "pin_memory": True,
     }
-    if val_kwargs["num_workers"] > 0:
+    if tc.val_num_workers > 0:
         val_kwargs["persistent_workers"] = True
-        val_kwargs["prefetch_factor"] = train_cfg.get("prefetch_factor", 2)
+        val_kwargs["prefetch_factor"] = tc.prefetch_factor
 
     val_loader = torch.utils.data.DataLoader(val_dataset, **val_kwargs)
 
-    steps_per_epoch = len(train_loader)
-    scheduler = setup_scheduler(optimizer, opt_cfg, steps_per_epoch)
+    scheduler = setup_scheduler(optimizer, opt, max_steps)
 
     import sentencepiece as spm
 
     sp = spm.SentencePieceProcessor()
-    sp.Load(tokenizer_model)
+    sp.Load(dc.tokenizer_model)
 
-    ckpt_cfg = train_cfg.get("checkpointing", {})
-    run_name = log_cfg.get("name", "run")
-    ckpt_dir = train_cfg.get("checkpoint_dir", f"checkpoints/{run_name}")
+    run_name = lc.name
+    ckpt_dir = f"checkpoints/{run_name}"
 
     ckpt_mgr = CheckpointManager(
         save_dir=ckpt_dir,
-        keep_top_k=ckpt_cfg.get("save_top_k", 5),
+        keep_top_k=cc.save_top_k,
     )
 
     train_logger = TrainLogger(
-        backend=log_cfg.get("backend", "tensorboard"),
-        project=log_cfg.get("project", "ru-moonshine"),
+        backend=lc.backend,
+        project=lc.project,
         name=run_name,
-        config=full_cfg,
+        config=cfg.model_dump(),
     )
 
     start_step = 0
@@ -435,20 +431,19 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
         lambda: ckpt_mgr.save_latest(model, optimizer, scheduler, global_step, scaler)
     )
 
-    nonfinite_patience = 5
+    nonfinite_patience = tc.nonfinite_patience
     nonfinite_count = 0
-    escape_wer_patience = train_cfg.get("validation", {}).get("escape_wer_patience", 0)
-    escape_wer_min_steps = train_cfg.get("validation", {}).get("escape_wer_min_steps", 5000)
+    escape_wer_patience = vc.escape_wer_patience
+    escape_wer_min_steps = vc.escape_wer_min_steps
     escape_wer_counter = 0
     last_val_wer = float("inf")
     escape_wer_stopped = False
-    log_every = train_cfg.get("log_every", 100)
-    val_every = train_cfg.get("validation", {}).get("every_n_steps", 2000)
-    ckpt_every = ckpt_cfg.get("every_n_steps", 2000)
-    val_max_batches = train_cfg.get("validation", {}).get("max_batches", 50)
+    log_every = tc.log_every
+    val_every = vc.every_n_steps
+    ckpt_every = cc.every_n_steps
+    val_max_batches = vc.max_batches
 
     timer = _StepTimer()
-    accum_loss_sum = 0.0
     accum_stats_buf = {"loss": 0.0, "loss_aed": 0.0, "loss_ctc": 0.0, "acc": 0.0}
 
     global_step = start_step
@@ -460,7 +455,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
     logger.info(
         f"Starting training: {max_steps} steps, batch={batch_size}, "
         f"accum={accum_steps}, amp={use_amp}, device={device}"
-        + (f", max_tokens={max_tokens}" if max_tokens else "")
+        + (f", max_tokens={bc.max_tokens}" if bc.max_tokens else "")
     )
 
     while global_step < max_steps:
@@ -543,10 +538,9 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                 step_loss = accum_stats_buf["loss"] / accum_steps
                 epoch_loss += step_loss
                 epoch_batches += 1
-                accum_loss_sum += step_loss
 
-                _log_temps(global_step)
-                _thermal_wait(global_step)
+                thermal.log(global_step)
+                thermal.wait_if_hot(global_step)
 
                 if global_step % log_every == 0:
                     timings = timer.results_ms()
@@ -562,7 +556,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         "train/loss_ctc": loss_ctc_val,
                         "train/acc": acc_val,
                         "train/grad_norm": grad_norm.item(),
-                        "train/lr": optimizer.param_groups[0].get("lr", opt_cfg.get("lr", 1e-3)),
+                        "train/lr": optimizer.param_groups[0].get("lr", opt.lr),
                         "train/step": global_step,
                         "train/epoch": epoch,
                         "train/batch_size": audio.shape[0],
@@ -581,7 +575,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         if timings["step_ms"] > 0:
                             log_metrics["timing/gpu_active_pct"] = total_compute / timings["step_ms"] * 100
 
-                    gs, cpu = _log_temps(global_step, force=True)
+                    gs, cpu = thermal.log(global_step, force=True)
                     if gs:
                         log_metrics["sys/gpu_temp"] = gs["temp"]
                         log_metrics["sys/gpu_power"] = gs["power"]
@@ -605,7 +599,7 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
                         timing_str = f" data={log_metrics['timing/data_load_ms']:.0f}ms fwd={log_metrics.get('timing/forward_ms', 0):.0f}ms"
                     ts = _temp_str()
                     temp_str = f" {ts}" if ts else ""
-                    bs_str = f" bs={audio.shape[0]}" if max_tokens else ""
+                    bs_str = f" bs={audio.shape[0]}" if bc.max_tokens else ""
                     logger.info(
                         f"[step {global_step}] loss={loss_val:.4f} "
                         f"aed={loss_aed_val:.4f} ctc={loss_ctc_val:.4f} "
@@ -702,14 +696,14 @@ def train(config_path: str, resume: bool = True, seed: int = 42):
 
     stopped_msg = " (early stopped)" if escape_wer_stopped else ""
     gs = _gpu_stats()
-    peak_str = f"Peak VRAM: {_peak_vram_mib:.0f}MB"
+    peak_str = f"Peak VRAM: {thermal._peak_vram_mib:.0f}MB"
     if gs:
-        peak_str += f" ({_peak_vram_mib / gs['mem_total_mib'] * 100:.0f}% of {gs['mem_total_mib']:.0f}MB)"
+        peak_str += f" ({thermal._peak_vram_mib / gs['mem_total_mib'] * 100:.0f}% of {gs['mem_total_mib']:.0f}MB)"
     logger.info(f"Training complete{stopped_msg}. Best WER: {best_wer:.2f}%. {peak_str}")
 
     if ckpt_mgr.checkpoint_paths:
         avg_path = str(Path(ckpt_dir) / "averaged.pt")
-        top_n = min(len(ckpt_mgr.checkpoint_paths), 5)
+        top_n = min(len(ckpt_mgr.checkpoint_paths), tc.average_top_n)
         average_checkpoints(ckpt_mgr.checkpoint_paths[:top_n], avg_path)
         logger.info(f"Averaged top-{top_n} checkpoints → {avg_path}")
 
@@ -720,7 +714,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train RuMoonshine")
     parser.add_argument("config", help="Path to training config YAML")
     parser.add_argument("--no-resume", action="store_true", help="Start from scratch")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -731,7 +725,7 @@ def main():
     faulthandler.enable()
 
     try:
-        train(args.config, resume=not args.no_resume, seed=args.seed)
+        train(args.config, resume=not args.no_resume, seed=args.seed or 42)
     except Exception as e:
         logging.getLogger(__name__).error(f"Training failed: {e}", exc_info=True)
         sys.exit(1)
